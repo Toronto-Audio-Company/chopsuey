@@ -542,6 +542,7 @@ pub(crate) fn create(
     let close_shared = shared.clone();
 
     let inner = create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
+        let t0 = std::time::Instant::now();
         // Inter (SIL Open Font License, assets/fonts/Inter-LICENSE.txt).
         // Static files: this vizia can't pick weights from the variable font.
         cx.add_font_mem(include_bytes!("../assets/fonts/Inter-Regular.ttf"));
@@ -596,6 +597,9 @@ pub(crate) fn create(
         .col_between(Pixels(4.0));
 
         ResizeHandle::new(cx);
+        if std::env::var_os("TEMPO_SAMPLER_TIMING").is_some() {
+            eprintln!("editor: built in {:?}", t0.elapsed());
+        }
     })?;
 
     Some(Box::new(ParentViewEditor {

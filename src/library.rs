@@ -34,6 +34,17 @@ pub struct Config {
     /// Detection results, by file path. Reused while size and mtime match.
     #[serde(default)]
     pub detected: HashMap<String, Detected>,
+    /// Every file found by the last scan with its length, by file path.
+    /// Shows the list instantly on open and skips re-reading unchanged files.
+    #[serde(default)]
+    pub scan_cache: HashMap<String, Scanned>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct Scanned {
+    pub size: u64,
+    pub modified: u64,
+    pub secs: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -259,6 +270,8 @@ impl Library {
     }
 
     fn scan(&self, generation: u64) {
+        let timing = std::env::var_os("TEMPO_SAMPLER_TIMING").is_some();
+        let t0 = Instant::now();
         let config = {
             let mut st = self.state.lock().unwrap();
             st.scanning = true;
@@ -266,50 +279,53 @@ impl Library {
         };
         self.bump();
 
-        // Pass 1: list files and read headers only. Fast.
+        // Pass 0: on first open, show last session's list straight from the
+        // scan cache (no disk or network access), while the real scan runs.
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.entries.len() <= 1 && !config.scan_cache.is_empty() {
+                st.entries = cached_entries(&config);
+                drop(st);
+                self.bump();
+                if timing {
+                    eprintln!("library: cached list shown after {:?}", t0.elapsed());
+                }
+            }
+        }
+
+        // Pass 1: list files, then (in parallel, since a network drive is
+        // mostly waiting) check each one's size and date. Unchanged files
+        // reuse their cached length; others have their header read.
         let mut files = Vec::new();
         for folder in &config.folders {
             walk(folder, 0, &mut files);
         }
-        let mut entries = vec![Entry::builtin()];
-        for path in files {
+        if timing {
+            eprintln!("library: listed {} files after {:?}", files.len(), t0.elapsed());
+        }
+        let scanned = parallel_map(&files, PROBE_THREADS, |path| {
             if self.cancelled(generation) {
-                return;
+                return None;
             }
-            // Header only (fast), any supported format.
-            let Ok((secs, _)) = crate::audio_file::probe(&path) else { continue };
-            let key = path.to_string_lossy().into_owned();
-            let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let folder = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-
-            let (base_bpm, source) = {
-                match bpm::bpm_from_name(&name) {
-                    Some(NameBpm::Explicit(b)) => (Some(b), BpmSource::FileName),
-                    Some(NameBpm::Bare(b)) if bpm::is_whole_bars(secs, b) => {
-                        (Some(b), BpmSource::FileName)
-                    }
-                    _ => match config.detected.get(&key) {
-                        Some(d)
-                            if d.version == bpm::DETECTOR_VERSION
-                                && Some((d.size, d.modified)) == file_stamp(&path) =>
-                        {
-                            match d.bpm {
-                                Some(b) if d.from_name => (Some(b), BpmSource::FileName),
-                                Some(b) => (Some(b), BpmSource::Detected),
-                                None => (None, BpmSource::Unknown),
-                            }
-                        }
-                        _ => (None, BpmSource::Pending),
-                    },
-                }
+            let stamp = file_stamp(path);
+            let key = path.to_string_lossy();
+            let cached = config.scan_cache.get(key.as_ref()).filter(|c| stamp == Some((c.size, c.modified)));
+            let secs = match cached {
+                Some(c) => c.secs,
+                None => crate::audio_file::probe(path).ok()?.0,
             };
-            let scale = scale_for(&config, &key, base_bpm);
-            let bpm = base_bpm.map(|b| b * scale);
-            entries.push(Entry { key, path: Some(path), name, folder, secs, bpm, base_bpm, scale, source });
+            Some((path.clone(), secs, stamp))
+        });
+        if self.cancelled(generation) {
+            return;
+        }
+        let mut entries = vec![Entry::builtin()];
+        let mut scan_cache = HashMap::new();
+        for (path, secs, stamp) in scanned {
+            if let Some((size, modified)) = stamp {
+                scan_cache.insert(path.to_string_lossy().into_owned(), Scanned { size, modified, secs });
+            }
+            entries.push(make_entry(&config, path, secs, stamp));
         }
         entries[1..].sort_by_key(|e| e.name.to_lowercase());
         // (key, path, length, bare tempo from the name if any)
@@ -331,27 +347,32 @@ impl Library {
                 return;
             }
             st.entries = entries;
+            st.config.scan_cache = scan_cache;
         }
         self.bump();
+        if timing {
+            eprintln!("library: scanned list shown after {:?} ({} to detect)", t0.elapsed(), pending.len());
+        }
 
-        // Pass 2: analyse files that have no tempo in their name.
-        let mut last_bump = Instant::now();
-        for (key, path, secs, hint) in pending {
+        // Pass 2: analyse files that have no tempo in their name, a few at a
+        // time (each holds a whole decoded file in memory).
+        let last_bump = Mutex::new(Instant::now());
+        parallel_map(&pending, DETECT_THREADS, |(key, path, secs, hint)| {
             if self.cancelled(generation) {
-                return;
+                return None::<()>;
             }
-            let detected = if secs <= MAX_FILE_SECS { detect_file(&path) } else { None };
+            let detected = if *secs <= MAX_FILE_SECS { detect_file(path) } else { None };
             // A bare number in the name ("Soul Sample 88") is trusted when
             // detection lands on it or its half/double, which also settles
             // which octave is right.
-            let from_name = match (detected, hint) {
+            let from_name = match (detected, *hint) {
                 (Some(d), Some(h)) => [h, h * 2.0, h / 2.0].iter().any(|&c| bpm::close(d, c, 0.03)),
                 _ => false,
             };
-            let bpm = if from_name { hint } else { detected };
+            let bpm = if from_name { *hint } else { detected };
             let mut st = self.state.lock().unwrap();
-            let scale = scale_for(&st.config, &key, bpm);
-            if let Some(e) = st.entries.iter_mut().find(|e| e.key == key) {
+            let scale = scale_for(&st.config, key, bpm);
+            if let Some(e) = st.entries.iter_mut().find(|e| &e.key == key) {
                 e.base_bpm = bpm;
                 e.scale = scale;
                 e.bpm = bpm.map(|b| b * scale);
@@ -361,16 +382,18 @@ impl Library {
                     (None, _) => BpmSource::Unknown,
                 };
             }
-            if let Some((size, modified)) = file_stamp(&path) {
+            if let Some((size, modified)) = file_stamp(path) {
                 let version = bpm::DETECTOR_VERSION;
-                st.config.detected.insert(key, Detected { size, modified, bpm, from_name, version });
+                st.config.detected.insert(key.clone(), Detected { size, modified, bpm, from_name, version });
             }
             drop(st);
-            if last_bump.elapsed() > Duration::from_millis(250) {
+            let mut last = last_bump.lock().unwrap();
+            if last.elapsed() > Duration::from_millis(250) {
                 self.bump();
-                last_bump = Instant::now();
+                *last = Instant::now();
             }
-        }
+            None
+        });
 
         let mut st = self.state.lock().unwrap();
         if self.cancelled(generation) {
@@ -380,7 +403,74 @@ impl Library {
         save_config(&st.config);
         drop(st);
         self.bump();
+        if timing {
+            eprintln!("library: tempos done after {:?}", t0.elapsed());
+        }
     }
+}
+
+/// Threads reading file headers: mostly waiting on the disk or network.
+const PROBE_THREADS: usize = 16;
+/// Threads detecting tempos: CPU-bound, and each holds a decoded file.
+const DETECT_THREADS: usize = 4;
+
+/// Builds a library entry. Tempo comes from the name, else the detection
+/// cache (if it matches the file's size and date), else it's pending.
+fn make_entry(config: &Config, path: PathBuf, secs: f32, stamp: Option<(u64, u64)>) -> Entry {
+    let key = path.to_string_lossy().into_owned();
+    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let folder = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (base_bpm, source) = match bpm::bpm_from_name(&name) {
+        Some(NameBpm::Explicit(b)) => (Some(b), BpmSource::FileName),
+        Some(NameBpm::Bare(b)) if bpm::is_whole_bars(secs, b) => (Some(b), BpmSource::FileName),
+        _ => match config.detected.get(&key) {
+            Some(d) if d.version == bpm::DETECTOR_VERSION && Some((d.size, d.modified)) == stamp => match d.bpm {
+                Some(b) if d.from_name => (Some(b), BpmSource::FileName),
+                Some(b) => (Some(b), BpmSource::Detected),
+                None => (None, BpmSource::Unknown),
+            },
+            _ => (None, BpmSource::Pending),
+        },
+    };
+    let scale = scale_for(config, &key, base_bpm);
+    let bpm = base_bpm.map(|b| b * scale);
+    Entry { key, path: Some(path), name, folder, secs, bpm, base_bpm, scale, source }
+}
+
+/// Last scan's list, rebuilt from the scan cache without touching the disk.
+fn cached_entries(config: &Config) -> Vec<Entry> {
+    let mut entries = vec![Entry::builtin()];
+    for (key, c) in &config.scan_cache {
+        if config.folders.iter().any(|f| Path::new(key).starts_with(f)) {
+            entries.push(make_entry(config, PathBuf::from(key), c.secs, Some((c.size, c.modified))));
+        }
+    }
+    entries[1..].sort_by_key(|e| e.name.to_lowercase());
+    entries
+}
+
+/// Runs `f` over `items` on `threads` threads; results keep the input order.
+fn parallel_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> Option<R> + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(items.len()).max(1) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                if let Some(r) = f(item) {
+                    out.lock().unwrap().push((i, r));
+                }
+            });
+        }
+    });
+    let mut out = out.into_inner().unwrap();
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, r)| r).collect()
 }
 
 fn detect_file(path: &Path) -> Option<f32> {
@@ -514,6 +604,14 @@ mod tests {
         let saved = load_config();
         assert_eq!(saved.folders, vec![samples.clone()]);
         assert!(saved.detected.values().any(|d| d.bpm == Some(95.0)));
+        assert_eq!(saved.scan_cache.len(), 3, "every audio file is in the scan cache");
+
+        // The next open can show the list from the cache alone, tempos
+        // included, without reading the folder.
+        let cached = cached_entries(&saved);
+        assert_eq!(cached.len(), 4);
+        let e = cached.iter().find(|e| e.name == "mystery").unwrap();
+        assert_eq!((e.bpm, e.source), (Some(95.0), BpmSource::Detected));
 
         // A ½× choice sticks and is saved; 1× clears it.
         let key = e.key.clone();
