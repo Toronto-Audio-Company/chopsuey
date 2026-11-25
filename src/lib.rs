@@ -16,6 +16,7 @@ pub mod library;
 mod editor;
 mod logo;
 pub mod loops;
+pub mod one_shots;
 pub mod stems;
 
 use library::Library;
@@ -147,9 +148,13 @@ pub struct SongView {
     /// (min, max) of the mono signal in `OVERVIEW_POINTS` equal slices.
     pub overview: Vec<(f32, f32)>,
     pub bar_starts: Vec<usize>,
+    /// Bar-aligned chops, then the one-shots (`bars == one_shots::ONE_SHOT`).
     pub chops: Vec<chops::Chop>,
     /// (min, max) waveform of each chop in `CHOP_OVERVIEW_POINTS` slices.
     pub chop_overviews: Vec<Vec<(f32, f32)>>,
+    /// Stem mask of the audio the one-shots were found in: they follow the
+    /// stem switches (solo the horns and their blasts are one-shots).
+    pub one_shot_mask: u8,
 }
 
 const OVERVIEW_POINTS: usize = 1200;
@@ -312,9 +317,10 @@ impl Shared {
         let view = self.song_view.lock().unwrap().clone().filter(|v| v.key == selection.key);
         let sig = match &view {
             Some(v) if tempo > 0.0 => format!(
-                "{}|{}|{length}|{tempo}|{}|{}|{:?}",
+                "{}|{}|{}|{length}|{tempo}|{}|{}|{:?}",
                 v.key,
                 v.bpm,
+                self.song_view_version.load(Ordering::Relaxed),
                 selection.stem_mask,
                 self.host_rate.load(Ordering::Relaxed),
                 self.pitch()
@@ -588,6 +594,8 @@ impl Shared {
             rendered.span = span;
             self.publish(id, bpm, rendered);
         }
+        // One-shots follow the stems that are on.
+        self.update_one_shots(&selection);
         // Tiles show the mix of the stems that are on: work those waveforms
         // out here rather than in the GUI's next draw.
         if selection.stem_mask != ALL_STEMS {
@@ -699,18 +707,15 @@ impl Shared {
             let stems = self.stems_for(&selection.key).ok_or("Stems aren't ready yet")?;
             Arc::new(stems::mix(&stems, selection.stem_mask, start, end))
         };
+        let one_shot = selection.chop.as_ref().is_some_and(|c| c.chop.bars == one_shots::ONE_SHOT);
         let (name, bpm) = match &selection.chop {
+            Some(c) if one_shot => (format!("{} - one shot {}", selection.name, c.number), c.chop.bpm),
             Some(c) => (format!("{} - {} bar chop {}", selection.name, c.chop.bars, c.number), c.chop.bpm),
             None => (selection.name.clone(), selection.bpm),
         };
-        Ok(LoopAsset::new(
-            &selection.render_key(),
-            &(name + &selection.stems_suffix()),
-            bpm,
-            src.sample_rate,
-            samples,
-        )
-        .with_pitch(self.pitch()))
+        let asset = LoopAsset::new(&selection.render_key(), &(name + &selection.stems_suffix()), bpm, src.sample_rate, samples)
+            .with_pitch(self.pitch());
+        Ok(if one_shot { asset.into_one_shot() } else { asset })
     }
 
     /// Runs chop analysis for a song (not a short loop) if it hasn't been
@@ -745,6 +750,14 @@ impl Shared {
             .iter()
             .map(|c| min_max_overview(&mono[c.start.min(mono.len())..c.end.min(mono.len())], CHOP_OVERVIEW_POINTS))
             .collect();
+        // One-shots in the full mix for now; `update_one_shots` redoes them
+        // for the stems that are on.
+        let mut chops = analysis.chops;
+        let mut chop_overviews: Vec<_> = chop_overviews;
+        for shot in one_shots::find_one_shots(&mono, src.sample_rate, selection.bpm) {
+            chop_overviews.push(min_max_overview(&mono[shot.start..shot.end], CHOP_OVERVIEW_POINTS));
+            chops.push(shot);
+        }
         *self.song_view.lock().unwrap() = Some(Arc::new(SongView {
             key: selection.key.clone(),
             bpm: selection.bpm,
@@ -752,26 +765,14 @@ impl Shared {
             sample_rate: src.sample_rate,
             overview,
             bar_starts: analysis.bar_starts,
-            chops: analysis.chops,
+            chops,
             chop_overviews,
+            one_shot_mask: ALL_STEMS,
         }));
-        // A chop saved with the Live set: select it again now its tiles exist.
-        let restore = self.restore_chop.lock().unwrap().take();
-        if let Some((key, start, end)) = restore.filter(|(k, _, _)| *k == selection.key) {
-            let view = self.song_view.lock().unwrap().clone();
-            if let Some(view) = view {
-                if let Some(index) = view.chops.iter().position(|c| c.start == start && c.end == end) {
-                    let chop = view.chops[index].clone();
-                    let bars = chop.bars;
-                    let number = view.chops[..index].iter().filter(|c| c.bars == bars).count() + 1;
-                    let mut sel = self.selection.lock().unwrap();
-                    if sel.key == key {
-                        sel.chop = Some(ChopSel { index, number, chop });
-                    }
-                }
-            }
-        }
+        self.restore_saved_chop();
         self.song_view_version.fetch_add(1, Ordering::Relaxed);
+        let current = self.selection.lock().unwrap().clone();
+        self.update_one_shots(&current);
         {
             let mut running = self.analysing.lock().unwrap();
             if running.as_deref() == Some(job.as_str()) {
@@ -780,6 +781,96 @@ impl Shared {
         }
         self.refresh_pads(); // chops are known now
         self.save_session(); // now known to be a song (and maybe its chop)
+    }
+
+    /// A chop saved with the Live set: selects it again once a tile with
+    /// its frames exists (bar chops after analysis; a one-shot maybe only
+    /// once its stems are on).
+    fn restore_saved_chop(&self) {
+        let Some(view) = self.song_view.lock().unwrap().clone() else { return };
+        let mut restore = self.restore_chop.lock().unwrap();
+        let Some((key, start, end)) = restore.clone() else { return };
+        if key != view.key || self.selection.lock().unwrap().chop.is_some() {
+            restore.take(); // another song, or a chop picked since: too late
+            return;
+        }
+        let Some(index) = view.chops.iter().position(|c| c.start == start && c.end == end) else { return };
+        restore.take();
+        let chop = view.chops[index].clone();
+        let number = view.chops[..index].iter().filter(|c| c.bars == chop.bars).count() + 1;
+        let mut sel = self.selection.lock().unwrap();
+        if sel.key == key {
+            sel.chop = Some(ChopSel { index, number, chop });
+        }
+    }
+
+    /// Finds the selected song's one-shots again in the audio that's
+    /// playing (the stems that are on), if that changed. Returns whether
+    /// the song view changed.
+    fn update_one_shots(&self, selection: &Selection) -> bool {
+        let Some(view) = self.song_view.lock().unwrap().clone().filter(|v| v.key == selection.key) else {
+            return false;
+        };
+        let mask = selection.stem_mask;
+        if view.one_shot_mask == mask {
+            return false;
+        }
+        let Ok(src) = self.source(selection) else { return false };
+        let full: Vec<f32> = src.samples.chunks(2).map(|f| (f[0] + f[1]) * 0.5).collect();
+        let mixed: Vec<f32>;
+        let heard = if mask == ALL_STEMS {
+            &full
+        } else {
+            let Some(stems) = self.stems_for(&view.key) else { return false };
+            mixed = stems::mix(&stems, mask, 0, view.frames).chunks(2).map(|f| (f[0] + f[1]) * 0.5).collect();
+            &mixed
+        };
+        let shots = one_shots::find_one_shots(heard, view.sample_rate, view.bpm);
+        let bar_chops = view.chops.iter().take_while(|c| c.bars != one_shots::ONE_SHOT).count();
+        let mut chops = view.chops[..bar_chops].to_vec();
+        let mut chop_overviews = view.chop_overviews[..bar_chops].to_vec();
+        for shot in shots {
+            chop_overviews.push(min_max_overview(&full[shot.start..shot.end.min(full.len())], CHOP_OVERVIEW_POINTS));
+            chops.push(shot);
+        }
+        let new = Arc::new(SongView {
+            key: view.key.clone(),
+            bpm: view.bpm,
+            frames: view.frames,
+            sample_rate: view.sample_rate,
+            overview: view.overview.clone(),
+            bar_starts: view.bar_starts.clone(),
+            chops,
+            chop_overviews,
+            one_shot_mask: mask,
+        });
+        {
+            let mut current = self.song_view.lock().unwrap();
+            if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &view)) {
+                return false; // replaced meanwhile
+            }
+            *current = Some(new.clone());
+        }
+        *self.mixed_overviews.lock().unwrap() = None;
+        // A selected one-shot keeps playing; its tile is found again if
+        // it's still there.
+        {
+            let mut sel = self.selection.lock().unwrap();
+            if sel.key == new.key {
+                if let Some(c) = sel.chop.as_mut().filter(|c| c.chop.bars == one_shots::ONE_SHOT) {
+                    match new.chops.iter().position(|x| x.start == c.chop.start && x.end == c.chop.end) {
+                        Some(i) => {
+                            c.index = i;
+                            c.number = i - bar_chops + 1;
+                        }
+                        None => c.index = usize::MAX,
+                    }
+                }
+            }
+        }
+        self.restore_saved_chop();
+        self.song_view_version.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// The selected song's stems, if they're ready.
@@ -1142,6 +1233,9 @@ pub enum ChopLength {
     Two,
     #[name = "4 bars"]
     Four,
+    /// Single sounds instead of bar-aligned loops (see `one_shots`).
+    #[name = "One shots"]
+    OneShots,
 }
 
 impl ChopLength {
@@ -1150,6 +1244,7 @@ impl ChopLength {
             ChopLength::One => 1,
             ChopLength::Two => 2,
             ChopLength::Four => 4,
+            ChopLength::OneShots => one_shots::ONE_SHOT,
         }
     }
 
@@ -1157,6 +1252,7 @@ impl ChopLength {
         match bars {
             1 => ChopLength::One,
             4 => ChopLength::Four,
+            one_shots::ONE_SHOT => ChopLength::OneShots,
             _ => ChopLength::Two,
         }
     }
@@ -1365,10 +1461,11 @@ impl TempoSampler {
         self.publish_pads_down();
     }
 
-    /// A pad was released: its voices fade out.
+    /// A pad was released: its voices fade out. One-shots play to their end
+    /// (like a Drum Rack's one-shot samples), unless choked in Mono mode.
     fn pad_off(&mut self, note: u8) {
         for v in self.voices.iter_mut().flatten() {
-            if v.note == note {
+            if v.note == note && !v.clip.one_shot {
                 v.held = false;
             }
         }
@@ -1592,9 +1689,12 @@ impl Plugin for TempoSampler {
             let frames = lp.frames();
             let pos = self.play_pos;
             let step = lp.sample_rate as f64 / self.sample_rate as f64;
-            self.play_pos = (pos + step) % frames as f64;
+            if lp.one_shot && pos >= (frames - 1) as f64 {
+                continue; // a one-shot plays once
+            }
+            self.play_pos = if lp.one_shot { pos + step } else { (pos + step) % frames as f64 };
             let i0 = (pos as usize).min(frames - 1);
-            let i1 = (i0 + 1) % frames;
+            let i1 = if lp.one_shot { (i0 + 1).min(frames - 1) } else { (i0 + 1) % frames };
             let frac = (pos - i0 as f64) as f32;
             // Unity gain, or loudness-matched: the level of what lands in the
             // set is up to the track.
@@ -1626,16 +1726,22 @@ impl Plugin for TempoSampler {
                 let target = if v.held { 1.0 } else { 0.0 };
                 v.level += (target - v.level) * coef;
                 let frames = v.clip.frames();
-                if frames == 0 || (!v.held && v.level < 1e-4) {
+                let one_shot = v.clip.one_shot;
+                let played_out = one_shot && v.pos >= (frames.max(1) - 1) as f64;
+                if frames == 0 || (!v.held && v.level < 1e-4) || played_out {
                     if let Some(done) = self.voices[slot].take() {
                         let _ = self.to_garbage.push(done.clip);
+                    }
+                    if played_out {
+                        self.publish_pads_down(); // its tile goes dark
                     }
                     continue;
                 }
                 let pos = v.pos;
-                v.pos = (pos + v.clip.sample_rate as f64 / self.sample_rate as f64) % frames as f64;
+                let step = v.clip.sample_rate as f64 / self.sample_rate as f64;
+                v.pos = if one_shot { pos + step } else { (pos + step) % frames as f64 };
                 let i0 = (pos as usize).min(frames - 1);
-                let i1 = (i0 + 1) % frames;
+                let i1 = if one_shot { (i0 + 1).min(frames - 1) } else { (i0 + 1) % frames };
                 let frac = (pos - i0 as f64) as f32;
                 let g = v.level * v.gain;
                 for ch in 0..2 {
@@ -1713,6 +1819,69 @@ mod tests {
             assert!(Instant::now() < deadline, "render {id} did not finish");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn one_shots_are_found_and_play_at_their_own_speed() {
+        // A 70 s "song": the test loop (bar chops), then shouts with pauses.
+        let sr = 48_000usize;
+        let looped = LoopAsset::test_loop().stretch_to(97.0).samples;
+        let mut samples = Vec::new();
+        while samples.len() < 2 * sr * 50 {
+            samples.extend_from_slice(&looped);
+        }
+        for k in 0..8 {
+            samples.extend(std::iter::repeat(0.0).take(2 * sr)); // 1 s pause
+            let len = sr * (5 + k) / 10; // 0.5 .. 1.2 s
+            samples.extend((0..len).flat_map(|i| {
+                let v = 0.4 * (std::f32::consts::TAU * 300.0 * i as f32 / sr as f32).sin();
+                [v, v]
+            }));
+        }
+        samples.extend(std::iter::repeat(0.0).take(2 * sr * 4));
+        let dir = std::env::temp_dir().join(format!("tempo-sampler-shots-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shouts.wav");
+        let spec = hound::WavSpec { channels: 2, sample_rate: 48_000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        samples.iter().for_each(|s| w.write_sample(*s).unwrap());
+        w.finalize().unwrap();
+
+        let plugin = TempoSampler::default();
+        let shared = plugin.shared.clone();
+        *shared.selection.lock().unwrap() = Selection {
+            key: path.to_string_lossy().into(),
+            path: Some(path.clone()),
+            name: "shouts".into(),
+            bpm: 97.0,
+            chop: None,
+            stem_mask: ALL_STEMS,
+        };
+        let src = shared.source(&shared.selection.lock().unwrap().clone()).unwrap();
+        let selection = shared.selection.lock().unwrap().clone();
+        shared.analyse_if_song(&selection, &src);
+        let view = shared.song_view.lock().unwrap().clone().expect("analysed");
+        let shots: Vec<usize> = (0..view.chops.len()).filter(|&i| view.chops[i].bars == one_shots::ONE_SHOT).collect();
+        assert!(shots.len() >= 8, "{} one-shots", shots.len());
+        assert!(view.chops.iter().any(|c| c.bars == 2), "bar chops too");
+        assert_eq!(view.chop_overviews.len(), view.chops.len());
+        // Bar chops first, one-shots after.
+        assert!(shots.iter().all(|&i| i >= view.chops.len() - shots.len()));
+
+        // The last shout (1.2 s), at 140 BPM: its own length, plays once.
+        let i = *shots.last().unwrap();
+        let chop = view.chops[i].clone();
+        shared.selection.lock().unwrap().chop = Some(ChopSel { index: i, number: shots.len(), chop: chop.clone() });
+        let id = shared.next_request();
+        shared.render(id, 140.0);
+        let r = shared.current().unwrap();
+        assert!(r.one_shot && !r.is_loop);
+        assert_eq!(r.frames(), chop.end - chop.start);
+        let secs = r.frames() as f32 / sr as f32;
+        assert!((secs - 1.2).abs() < 0.1, "{secs} s");
+        assert_eq!(r.file_name(), format!("shouts - one shot {}.wav", shots.len()));
+        // Same stems: nothing to redo.
+        assert!(!shared.update_one_shots(&shared.selection.lock().unwrap().clone()));
     }
 
     #[test]

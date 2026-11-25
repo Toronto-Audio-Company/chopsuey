@@ -24,6 +24,8 @@ pub struct LoopAsset {
     pub samples: Arc<Vec<f32>>,
     /// Pitch shift applied while stretching (tempo unchanged).
     pub pitch: Pitch,
+    /// A single sound (see `one_shots`): plays at its own speed, once.
+    pub one_shot: bool,
 }
 
 /// A pitch shift like Ableton's clip Transpose and Detune: whole semitones
@@ -87,6 +89,8 @@ pub struct RenderedLoop {
     /// `key_hash(key)`, so the audio thread can check it's the wanted clip.
     pub key_hash: u64,
     pub pitch: Pitch,
+    /// Plays once at its own speed; exported without tempo or loop data.
+    pub one_shot: bool,
 }
 
 /// A non-zero hash of a render key (0 means "any clip" to the audio thread).
@@ -131,6 +135,39 @@ impl LoopAsset {
             sample_rate,
             samples,
             pitch: Pitch::NONE,
+            one_shot: false,
+        }
+    }
+
+    /// Marks this as a one-shot: never stretched to a tempo or looped, and
+    /// faded in and out over a few milliseconds so a cut never clicks.
+    pub fn into_one_shot(mut self) -> Self {
+        self.one_shot = true;
+        self.is_loop = false;
+        let (fade_in, fade_out) = (self.sample_rate as usize / 200, self.sample_rate as usize / 50);
+        let samples = Arc::make_mut(&mut self.samples);
+        let frames = samples.len() / 2;
+        for i in 0..fade_in.min(frames) {
+            let g = i as f32 / fade_in as f32;
+            samples[i * 2] *= g;
+            samples[i * 2 + 1] *= g;
+        }
+        for i in 0..fade_out.min(frames) {
+            let g = i as f32 / fade_out as f32;
+            let f = frames - 1 - i;
+            samples[f * 2] *= g;
+            samples[f * 2 + 1] *= g;
+        }
+        self
+    }
+
+    /// Input frames per output frame to play at `target_bpm` (one-shots
+    /// keep their own speed).
+    fn ratio(&self, target_bpm: f32) -> f64 {
+        if self.one_shot {
+            1.0
+        } else {
+            self.bpm as f64 / target_bpm as f64
         }
     }
 
@@ -238,11 +275,13 @@ impl LoopAsset {
     /// Songs are stretched once, start to end.
     pub fn stretch_to(&self, target_bpm: f32) -> RenderedLoop {
         let in_frames = self.frames();
-        let ratio = self.bpm as f64 / target_bpm as f64;
+        let ratio = self.ratio(target_bpm);
         let out_frames = (in_frames as f64 * ratio).round() as usize;
         let mut stretch = self.pitch.stretcher(self.sample_rate);
 
-        let samples = if self.is_loop {
+        let samples = if self.one_shot && self.pitch.is_none() {
+            self.samples.to_vec() // played as it is
+        } else if self.is_loop {
             // Half a second of context each side: several times the
             // stretcher's ~0.12 s window. A loop shorter than that wraps once.
             let pad = (self.sample_rate as usize / 2).min(in_frames);
@@ -268,7 +307,7 @@ impl LoopAsset {
         if self.is_loop {
             return Some(self.stretch_to(target_bpm));
         }
-        let out_frames = (self.frames() as f64 * self.bpm as f64 / target_bpm as f64).round() as usize;
+        let out_frames = (self.frames() as f64 * self.ratio(target_bpm)).round() as usize;
         let samples = self.stretch_stream(out_frames, None, cancelled)?;
         Some(self.rendered(target_bpm, samples, false))
     }
@@ -278,7 +317,7 @@ impl LoopAsset {
     /// asked and keeps the start, so it matches the full render (the
     /// stretcher only looks a short way ahead).
     pub fn stretch_start(&self, target_bpm: f32, in_frames: usize) -> RenderedLoop {
-        let ratio = self.bpm as f64 / target_bpm as f64;
+        let ratio = self.ratio(target_bpm);
         let out_frames = (self.frames() as f64 * ratio).round() as usize;
         let keep = ((in_frames as f64 * ratio).round() as usize).min(out_frames);
         let samples = self.stretch_stream(out_frames, Some(keep), &|| false).expect("not cancelled");
@@ -368,6 +407,7 @@ impl LoopAsset {
             partial,
             key_hash: key_hash(&self.key),
             pitch: self.pitch,
+            one_shot: self.one_shot,
         }
     }
 }
@@ -382,8 +422,12 @@ impl RenderedLoop {
     }
 
     /// File name like "Test Loop - 71 BPM.wav", "Test Loop - 92.5 BPM.wav"
-    /// or, pitched, "Test Loop - 71 BPM +3st.wav".
+    /// or, pitched, "Test Loop - 71 BPM +3st.wav". One-shots have no tempo:
+    /// "Song - one shot 3.wav".
     pub fn file_name(&self) -> String {
+        if self.one_shot {
+            return format!("{}{}.wav", self.name, self.pitch.suffix());
+        }
         let bpm = format!("{:.2}", self.bpm);
         let bpm = bpm.trim_end_matches('0').trim_end_matches('.');
         format!("{} - {bpm} BPM{}.wav", self.name, self.pitch.suffix())
@@ -416,6 +460,9 @@ impl RenderedLoop {
     /// the tempo of a dropped file) and, for loops, `smpl` with a loop over
     /// the whole file.
     pub fn tempo_chunks(&self) -> Vec<([u8; 4], Vec<u8>)> {
+        if self.one_shot {
+            return Vec::new(); // no tempo, so Live doesn't warp it
+        }
         let mut acid = Vec::with_capacity(24);
         // Flags: root note set (0x02), stretch (0x04); one-shot (0x01) off.
         acid.extend_from_slice(&(0x02u32 | 0x04).to_le_bytes());
@@ -547,6 +594,27 @@ mod tests {
         let mid = &left[sr..2 * sr];
         let crossings = mid.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
         assert!((crossings as f32 - 440.0).abs() < 5.0, "measured {crossings} Hz, want 440");
+    }
+
+    #[test]
+    fn one_shots_keep_their_speed() {
+        let sr = 48_000;
+        let tone: Vec<f32> = (0..sr * 2).flat_map(|i| {
+            let s = (TAU * 440.0 * i as f32 / sr as f32).sin() * 0.5;
+            [s, s]
+        }).collect();
+        let shot = LoopAsset::new("k", "shot", 97.0, sr as u32, tone.clone()).into_one_shot();
+        assert!(!shot.is_loop);
+        // Untouched at any tempo, apart from the edge fades.
+        let r = shot.stretch_to(140.0);
+        assert!(r.one_shot);
+        assert_eq!(r.frames(), 2 * sr);
+        assert_eq!(r.samples[2000..4 * sr - 8000], tone[2000..4 * sr - 8000]);
+        assert_eq!(r.samples[0], 0.0, "faded in");
+        assert!(r.samples[r.samples.len() - 1].abs() < 1e-3, "faded out");
+        // Pitched: same length.
+        let up = LoopAsset::new("k", "shot", 97.0, sr as u32, tone).into_one_shot().with_pitch(Pitch { semitones: 12, cents: 0 });
+        assert_eq!(up.stretch_to(140.0).frames(), 2 * sr);
     }
 
     #[test]
@@ -713,6 +781,7 @@ mod tests {
             partial: false,
             key_hash: 0,
             pitch: Pitch::NONE,
+            one_shot: false,
         };
         assert_eq!(mk(71.0).file_name(), "Test Loop - 71 BPM.wav");
         assert_eq!(mk(92.5).file_name(), "Test Loop - 92.5 BPM.wav");
@@ -720,5 +789,14 @@ mod tests {
         assert_eq!(pitched(3, 0).file_name(), "Test Loop - 120 BPM +3st.wav");
         assert_eq!(pitched(-12, 25).file_name(), "Test Loop - 120 BPM -12st +25ct.wav");
         assert_eq!(pitched(0, -50).file_name(), "Test Loop - 120 BPM -50ct.wav");
+        let shot = |semitones| RenderedLoop {
+            name: "Song - one shot 3".into(),
+            one_shot: true,
+            pitch: Pitch { semitones, cents: 0 },
+            ..mk(120.0)
+        };
+        assert_eq!(shot(0).file_name(), "Song - one shot 3.wav");
+        assert_eq!(shot(-5).file_name(), "Song - one shot 3 -5st.wav");
+        assert!(shot(0).tempo_chunks().is_empty());
     }
 }

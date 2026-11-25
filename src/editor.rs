@@ -636,6 +636,10 @@ pub(crate) fn create(
         if let Some(bits) = std::env::var("TEMPO_SAMPLER_DEMO_STEMS").ok().and_then(|b| u8::from_str_radix(&b, 2).ok()) {
             shared.stem_switches.store(bits, Ordering::Relaxed);
         }
+        // Development: TEMPO_SAMPLER_DEMO_LENGTH=<bars> (0: one shots) picks the chop grid.
+        if let Some(bars) = std::env::var("TEMPO_SAMPLER_DEMO_LENGTH").ok().and_then(|b| b.parse::<usize>().ok()) {
+            shared.chop_length.store(bars, Ordering::Relaxed);
+        }
         let selected_key = shared.selection.lock().unwrap().key.clone();
         AppData {
             shared: shared.clone(),
@@ -1086,16 +1090,27 @@ fn title_block(cx: &mut Context) {
         .col_between(Pixels(8.0))
         .child_top(Pixels(0.0))
         .height(Auto);
-        // "88 BPM · 1:30", plus "Stretching…" or an error while relevant.
-        Label::new(
-            cx,
-            AppData::root.map(|d| match render_status(&d.shared) {
-                Some(status) => format!("{} · {status}", d.selected_meta),
-                None => d.selected_meta.clone(),
-            }),
-        )
-        .class("subdued")
-        .text_wrap(false);
+        // "88 BPM · 1:30", plus "Stretching…" or an error while relevant;
+        // then the controls that apply to the whole file: pitch and tempo.
+        HStack::new(cx, |cx| {
+            Label::new(
+                cx,
+                AppData::root.map(|d| match render_status(&d.shared) {
+                    Some(status) => format!("{} · {status}", d.selected_meta),
+                    None => d.selected_meta.clone(),
+                }),
+            )
+            .class("subdued")
+            .text_wrap(false)
+            .width(Stretch(1.0));
+            pitch_controls(cx);
+            tempo_switch(cx);
+        })
+        .class("title-controls")
+        .col_between(Pixels(8.0))
+        .child_top(Stretch(1.0))
+        .child_bottom(Stretch(1.0))
+        .height(Pixels(32.0));
     })
     .row_between(Pixels(8.0))
     .child_left(Pixels(CARD_INSET))
@@ -1104,7 +1119,7 @@ fn title_block(cx: &mut Context) {
 }
 
 /// ½× / 1× / 2×: the detected tempo, halved or doubled when detection
-/// picked the wrong octave. Sits in the chops / loop card header.
+/// picked the wrong octave. Sits beside the details under the title.
 fn tempo_switch(cx: &mut Context) {
     HStack::new(cx, |cx| {
         for (scale, label) in [(0.5f32, "½×"), (1.0, "1×"), (2.0, "2×")] {
@@ -1363,11 +1378,13 @@ fn chops_card(cx: &mut Context, shared: Arc<Shared>, view: Arc<crate::SongView>)
         centred(HStack::new(cx, |cx| {
             Icon::new(cx, ICON_CUT).class("lead-icon");
             Label::new(cx, "Chops").width(Stretch(1.0));
-            pitch_controls(cx);
-            tempo_switch(cx);
             HStack::new(cx, |cx| {
-                for bars in [2usize, 4, 1] {
-                    let label = if bars == 1 { "1 bar".to_string() } else { format!("{bars} bars") };
+                for bars in [2usize, 4, 1, crate::one_shots::ONE_SHOT] {
+                    let label = match bars {
+                        crate::one_shots::ONE_SHOT => "One shots".to_string(),
+                        1 => "1 bar".to_string(),
+                        _ => format!("{bars} bars"),
+                    };
                     Button::new(cx, move |cx| cx.emit(AppEvent::SetChopLength(bars)), move |cx| Label::new(cx, &label))
                         .checked(chop_length_lens().map(move |l| *l == bars));
                 }
@@ -1392,7 +1409,7 @@ fn chops_card(cx: &mut Context, shared: Arc<Shared>, view: Arc<crate::SongView>)
                 for row in indices.chunks(TILES_PER_ROW) {
                     HStack::new(cx, |cx| {
                         for &i in row {
-                            ChopTile::new(cx, shared.clone(), i, &view.chops);
+                            ChopTile::new(cx, shared.clone(), i, &view);
                         }
                         // Keep tiles the same width on a short last row.
                         for _ in row.len()..TILES_PER_ROW {
@@ -1405,6 +1422,9 @@ fn chops_card(cx: &mut Context, shared: Arc<Shared>, view: Arc<crate::SongView>)
             })
             .row_between(Pixels(8.0))
             .height(Auto);
+            if indices.is_empty() && length == crate::one_shots::ONE_SHOT {
+                Label::new(cx, "No one-shots in what's playing").class("tiles-empty");
+            }
         });
     })
     .class("card")
@@ -1427,8 +1447,6 @@ fn loop_card(cx: &mut Context) {
             Icon::new(cx, ICON_WAVE_SINE).class("lead-icon");
             Label::new(cx, AppData::selected_is_loop.map(|l| if *l { "Loop" } else { "Sample" }))
                 .width(Stretch(1.0));
-            pitch_controls(cx);
-            tempo_switch(cx);
         }))
         .class("card-title")
         .col_between(Pixels(8.0));
@@ -1580,10 +1598,16 @@ impl ChopTile {
         cx: &'a mut Context,
         shared: Arc<Shared>,
         index: usize,
-        chops: &[crate::chops::Chop],
+        view: &crate::SongView,
     ) -> Handle<'a, Self> {
-        let chop = &chops[index];
-        let label = format!("Bar {}", chop.first_bar + 1);
+        let chop = &view.chops[index];
+        let label = if chop.bars == crate::one_shots::ONE_SHOT {
+            // Where it is in the song, "1:23".
+            let secs = chop.start / view.sample_rate.max(1) as usize;
+            format!("{}:{:02}", secs / 60, secs % 60)
+        } else {
+            format!("Bar {}", chop.first_bar + 1)
+        };
         Self { index, hold: Hold::default() }
             .build(cx, move |cx| {
                 wave_frame(cx, |cx| {

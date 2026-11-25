@@ -573,3 +573,16 @@ chop-tile label {
 .hidden {
   display: none;
 }
+
+/* Under an empty one-shot grid. */
+.tiles-empty {
+  font-size: 13;
+  color: #616161;
+  height: 32px;
+}
+
+/* Pitch and tempo beside the details sit on the sheet, not a card: a
+   darker track so they read as controls. */
+.title-controls .segmented {
+  background-color: #e3e3e3;
+}
