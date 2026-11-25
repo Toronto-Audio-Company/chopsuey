@@ -75,7 +75,7 @@ impl Separator {
         if engine.gpu {
             match build_session(model, 2, true) {
                 Ok(session) => workers.push(Worker { label: "gpu", session: session.into() }),
-                Err(e) => eprintln!("Tempo Sampler: WebGPU unavailable, using CPU ({e})"),
+                Err(e) => eprintln!("chopsuey: WebGPU unavailable, using CPU ({e})"),
             }
         }
         if engine.cpu_threads > 0 || workers.is_empty() {
@@ -223,7 +223,7 @@ pub fn model_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("TEMPO_SAMPLER_MODEL") {
         return Some(p.into());
     }
-    let binary = own_binary_path()?; // .../Tempo Sampler.vst3/Contents/MacOS/Tempo Sampler
+    let binary = own_binary_path()?; // .../chopsuey.vst3/Contents/MacOS/chopsuey
     let path = binary.parent()?.parent()?.join("Resources").join(MODEL_FILE);
     path.exists().then_some(path)
 }
@@ -275,8 +275,7 @@ pub fn cache_root() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("TEMPO_SAMPLER_STEM_CACHE") {
         return p.into();
     }
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    home.join("Library/Caches/Tempo Sampler/stems")
+    crate::library::app_folder("Caches").join("stems")
 }
 
 /// Oldest-used stems are deleted once the cache grows past this.

@@ -2,7 +2,7 @@
 //! each loop's tempo came from.
 //!
 //! Settings and the detection cache live in
-//! `~/Library/Application Support/Tempo Sampler/library.json`, shared by every
+//! `~/Library/Application Support/chopsuey/library.json`, shared by every
 //! plugin instance and every Ableton set.
 
 use serde::{Deserialize, Serialize};
@@ -526,8 +526,24 @@ fn config_path() -> PathBuf {
     if let Some(p) = std::env::var_os("TEMPO_SAMPLER_CONFIG") {
         return PathBuf::from(p);
     }
+    app_folder("Application Support").join("library.json")
+}
+
+/// The app's display name, also its folder name on disk.
+pub const APP_NAME: &str = "chopsuey";
+/// What the app was called before, for moving its folders over.
+const OLD_APP_NAME: &str = "Tempo Sampler";
+
+/// `~/Library/<kind>/chopsuey`. The first time, a folder under the app's
+/// old name is moved here, so settings and caches carry over the rename.
+pub fn app_folder(kind: &str) -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    home.join("Library/Application Support/Tempo Sampler/library.json")
+    let base = home.join("Library").join(kind);
+    let (new, old) = (base.join(APP_NAME), base.join(OLD_APP_NAME));
+    if !new.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, &new);
+    }
+    new
 }
 
 fn load_config() -> Config {

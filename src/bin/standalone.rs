@@ -1,4 +1,4 @@
-//! Runs Tempo Sampler as a standalone app (no DAW), for development and
+//! Runs chopsuey as a standalone app (no DAW), for development and
 //! screenshots: `cargo run --release --bin standalone -- --backend dummy`.
 //! Set TEMPO_SAMPLER_DEMO=<part of a name> to select that loop or song on launch.
 

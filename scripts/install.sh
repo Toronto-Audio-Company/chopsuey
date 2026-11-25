@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds, tests and installs Tempo Sampler as a VST3 for the current user.
+# Builds, tests and installs chopsuey as a VST3 for the current user.
 #
 #   scripts/install.sh
 #
@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL=models/htdemucs_fp16weights.onnx
-BUNDLE="target/bundled/Tempo Sampler.vst3"
+BUNDLE="target/bundled/chopsuey.vst3"
 DEST="$HOME/Library/Audio/Plug-Ins/VST3"
 
 if [[ ! -f "$MODEL" ]]; then
@@ -41,6 +41,9 @@ codesign --verify --deep --strict "$BUNDLE"
 
 echo "== Installing to $DEST"
 mkdir -p "$DEST"
+rm -rf "$DEST/chopsuey.vst3"
+# The app used to be called "Tempo Sampler": remove that build too, since it
+# has the same plugin ID and Live would list two copies.
 rm -rf "$DEST/Tempo Sampler.vst3"
 cp -R "$BUNDLE" "$DEST/"
 echo "Installed. Restart Live to load the new build."

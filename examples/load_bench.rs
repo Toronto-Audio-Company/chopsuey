@@ -14,7 +14,8 @@ use tempo_sampler::library::Library;
 fn main() {
     let cold = std::env::args().any(|a| a == "--cold");
     let home = std::env::var("HOME").unwrap();
-    let real = format!("{home}/Library/Application Support/Tempo Sampler/library.json");
+    let _ = home;
+    let real = tempo_sampler::library::app_folder("Application Support").join("library.json");
     let scratch = std::env::temp_dir().join(format!("tempo-sampler-bench-{}.json", std::process::id()));
     let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&real).expect("no library settings")).unwrap();
     if cold {

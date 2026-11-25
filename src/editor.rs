@@ -576,7 +576,7 @@ pub(crate) fn create(
         cx.add_font_mem(include_bytes!("../assets/fonts/Inter-Bold.ttf"));
         // All colours, spacing and type live in the stylesheet (src/style.css).
         if let Err(e) = cx.add_stylesheet(include_str!("style.css")) {
-            nih_plug::nih_log!("Tempo Sampler: couldn't load stylesheet: {e}");
+            nih_plug::nih_log!("chopsuey: couldn't load stylesheet: {e}");
         }
 
         // Development: TEMPO_SAMPLER_DEMO_STEMS=0011 sets the stem switches.
@@ -801,7 +801,7 @@ fn sidebar(cx: &mut Context) {
             .class("brand-mark")
             .child_left(Stretch(1.0))
             .child_right(Stretch(1.0));
-            Label::new(cx, "Tempo Sampler");
+            Label::new(cx, crate::library::APP_NAME);
         }))
         .class("brand")
         // Logo (22px, wider than the icon column) on the box line, name on

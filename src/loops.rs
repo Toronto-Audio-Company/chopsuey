@@ -389,7 +389,9 @@ pub fn export_dir() -> PathBuf {
         return p.into();
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    home.join("Music").join("Tempo Sampler")
+    // New exports only: files already in the old "Tempo Sampler" folder
+    // stay there, because Ableton sets point at them.
+    home.join("Music").join(crate::library::APP_NAME)
 }
 
 #[cfg(test)]

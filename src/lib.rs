@@ -975,8 +975,8 @@ impl TempoSampler {
 }
 
 impl Plugin for TempoSampler {
-    const NAME: &'static str = "Tempo Sampler";
-    const VENDOR: &'static str = "Tempo Sampler";
+    const NAME: &'static str = "chopsuey";
+    const VENDOR: &'static str = "chopsuey";
     const URL: &'static str = "";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -1214,6 +1214,8 @@ impl Plugin for TempoSampler {
 }
 
 impl ClapPlugin for TempoSampler {
+    // IDs keep the old name on purpose: hosts identify the plugin by them,
+    // so sets made before the rename still find it.
     const CLAP_ID: &'static str = "dev.temposampler.tempo-sampler";
     const CLAP_DESCRIPTION: Option<&'static str> =
         Some("Shows the host tempo and stretches a loop to match it");
