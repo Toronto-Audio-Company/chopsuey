@@ -6,13 +6,17 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-/// A loop as stored on disk, at its original tempo. Always stereo.
+/// A loop or song as stored on disk, at its original tempo. Always stereo.
 pub struct LoopAsset {
+    /// Library key (file path, or the built-in key).
+    pub key: String,
     pub name: String,
     /// Tempo the loop was recorded at.
     pub bpm: f32,
-    /// Length in quarter-note beats.
+    /// Length in quarter-note beats (whole beats for loops).
     pub beats: f32,
+    /// Whole bars that should repeat seamlessly; otherwise a song or chop.
+    pub is_loop: bool,
     pub sample_rate: u32,
     /// Interleaved stereo samples (L, R, L, R, ...).
     pub samples: Vec<f32>,
@@ -21,9 +25,14 @@ pub struct LoopAsset {
 /// A loop stretched to a particular project tempo. Same sample rate and beat
 /// length as its source, just a different number of frames.
 pub struct RenderedLoop {
+    pub key: String,
     pub name: String,
     pub bpm: f32,
     pub beats: f32,
+    pub is_loop: bool,
+    /// Where this audio sits in the selected song, as fractions (0..1) of
+    /// the song's length: the whole song, or one chop. For the playhead.
+    pub span: Option<(f32, f32)>,
     pub sample_rate: u32,
     /// Interleaved stereo samples.
     pub samples: Vec<f32>,
@@ -37,62 +46,91 @@ impl LoopAsset {
     /// The built-in test loop, compiled into the plugin binary.
     pub fn test_loop() -> Self {
         let bytes = include_bytes!("../assets/test_loop_120bpm.wav");
-        Self::from_wav_bytes("Test Loop", 120.0, bytes).expect("embedded test loop is valid")
+        let (samples, sample_rate) = decode_wav(hound::WavReader::new(Cursor::new(&bytes[..])).unwrap())
+            .expect("embedded test loop is valid");
+        Self::new(crate::library::BUILTIN_KEY, "Test Loop", 120.0, sample_rate, samples)
     }
 
-    /// Decodes a WAV file. The beat length is derived from the duration and `bpm`.
-    pub fn from_wav_bytes(name: &str, bpm: f32, bytes: &[u8]) -> Result<Self, hound::Error> {
-        let reader = hound::WavReader::new(Cursor::new(bytes))?;
-        let spec = reader.spec();
-        let raw: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader.into_samples::<f32>().collect::<Result<_, _>>()?,
-            hound::SampleFormat::Int => {
-                let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
-                reader
-                    .into_samples::<i32>()
-                    .map(|s| s.map(|s| s as f32 * scale))
-                    .collect::<Result<_, _>>()?
-            }
-        };
-        let ch = spec.channels as usize;
-        let samples: Vec<f32> = raw
-            .chunks_exact(ch)
-            .flat_map(|f| {
-                let l = f[0];
-                let r = if ch > 1 { f[1] } else { f[0] };
-                [l, r]
-            })
-            .collect();
-        let secs = (samples.len() / 2) as f32 / spec.sample_rate as f32;
-        Ok(Self {
+    /// Decodes an audio file (any supported format) from disk.
+    pub fn from_file(path: &Path, key: &str, name: &str, bpm: f32) -> Result<Self, String> {
+        let (samples, sample_rate) = crate::audio_file::decode(path)?;
+        Ok(Self::new(key, name, bpm, sample_rate, samples))
+    }
+
+    pub fn new(key: &str, name: &str, bpm: f32, sample_rate: u32, samples: Vec<f32>) -> Self {
+        let secs = (samples.len() / 2) as f32 / sample_rate as f32;
+        let is_loop = crate::bpm::is_loop(secs, bpm);
+        let beats = secs * bpm / 60.0;
+        Self {
+            key: key.to_string(),
             name: name.to_string(),
             bpm,
-            beats: (secs * bpm / 60.0).round(),
-            sample_rate: spec.sample_rate,
+            // Loops are whole beats; round off small trimming errors.
+            beats: if is_loop { beats.round().max(1.0) } else { beats },
+            is_loop,
+            sample_rate,
             samples,
-        })
+        }
     }
+}
 
-    /// Stretches the loop to `target_bpm` without changing its pitch.
+/// Decodes any PCM/float WAV to interleaved stereo f32 (mono is duplicated,
+/// channels beyond two are dropped). Returns (samples, sample rate).
+pub fn decode_wav<R: std::io::Read>(
+    reader: hound::WavReader<R>,
+) -> Result<(Vec<f32>, u32), hound::Error> {
+    let spec = reader.spec();
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.into_samples::<f32>().collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .into_samples::<i32>()
+                .map(|s| s.map(|s| s as f32 * scale))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    let ch = (spec.channels as usize).max(1);
+    let samples = raw
+        .chunks_exact(ch)
+        .flat_map(|f| [f[0], if ch > 1 { f[1] } else { f[0] }])
+        .collect();
+    Ok((samples, spec.sample_rate))
+}
+
+impl LoopAsset {
+
+    /// Stretches to `target_bpm` without changing pitch.
     ///
-    /// The result loops seamlessly: we stretch three back-to-back copies and
-    /// keep the middle one, so the stretcher's start-up and tail artifacts land
-    /// in the discarded copies and the seam is processed like any other point.
+    /// Loops come out seamless: we stretch three back-to-back copies and keep
+    /// the middle one, so the stretcher's start-up and tail artifacts land in
+    /// the discarded copies and the seam is processed like any other point.
+    /// Songs and chops are stretched once, start to end.
     pub fn stretch_to(&self, target_bpm: f32) -> RenderedLoop {
         let in_frames = self.frames();
         let out_frames = (in_frames as f64 * self.bpm as f64 / target_bpm as f64).round() as usize;
-
-        let tiled: Vec<f32> = self.samples.repeat(3);
-        let mut out = vec![0.0f32; out_frames * 3 * 2];
         let mut stretch = signalsmith_stretch::Stretch::preset_default(2, self.sample_rate);
-        stretch.exact(&tiled, &mut out);
+
+        let samples = if self.is_loop {
+            let tiled: Vec<f32> = self.samples.repeat(3);
+            let mut out = vec![0.0f32; out_frames * 3 * 2];
+            stretch.exact(&tiled, &mut out);
+            out[out_frames * 2..out_frames * 4].to_vec()
+        } else {
+            let mut out = vec![0.0f32; out_frames * 2];
+            stretch.exact(&self.samples, &mut out);
+            out
+        };
 
         RenderedLoop {
+            key: self.key.clone(),
             name: self.name.clone(),
             bpm: target_bpm,
             beats: self.beats,
+            is_loop: self.is_loop,
+            span: None,
             sample_rate: self.sample_rate,
-            samples: out[out_frames * 2..out_frames * 4].to_vec(),
+            samples,
         }
     }
 }
@@ -136,6 +174,10 @@ impl RenderedLoop {
 /// Where exported WAVs go. Persistent (not a cache folder), because Ableton
 /// keeps referencing the file after you drop it into a set.
 pub fn export_dir() -> PathBuf {
+    // Tests write somewhere temporary instead.
+    if let Some(p) = std::env::var_os("TEMPO_SAMPLER_EXPORT_DIR") {
+        return p.into();
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     home.join("Music").join("Tempo Sampler")
 }
@@ -177,7 +219,8 @@ mod tests {
                 [s, s]
             })
             .collect();
-        let a = LoopAsset { name: "sine".into(), bpm: 120.0, beats: 4.0, sample_rate: sr as u32, samples };
+        let a = LoopAsset::new("sine", "sine", 120.0, sr as u32, samples);
+        assert!(a.is_loop);
         let r = a.stretch_to(80.0);
         assert_eq!(r.frames(), 3 * sr);
 
@@ -186,6 +229,19 @@ mod tests {
         let mid = &left[sr..2 * sr];
         let crossings = mid.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
         assert!((crossings as f32 - 440.0).abs() < 5.0, "measured {crossings} Hz, want 440");
+    }
+
+    #[test]
+    fn songs_stretch_start_to_end() {
+        // 2.5 bars isn't a loop: stretched once, length scales with tempo.
+        let base = LoopAsset::test_loop();
+        let five_secs: Vec<f32> = base.samples.iter().chain(&base.samples).take(5 * 48_000 * 2).copied().collect();
+        let a = LoopAsset::new("chop", "chop", 120.0, 48_000, five_secs);
+        assert!(!a.is_loop);
+        assert_eq!(a.beats, 10.0);
+        let r = a.stretch_to(100.0);
+        assert!(!r.is_loop);
+        assert_eq!(r.frames(), 6 * 48_000);
     }
 
     #[test]
@@ -209,7 +265,16 @@ mod tests {
 
     #[test]
     fn file_names() {
-        let mk = |bpm| RenderedLoop { name: "Test Loop".into(), bpm, beats: 8.0, sample_rate: 48_000, samples: vec![] };
+        let mk = |bpm| RenderedLoop {
+            key: "k".into(),
+            name: "Test Loop".into(),
+            bpm,
+            beats: 8.0,
+            is_loop: true,
+            span: None,
+            sample_rate: 48_000,
+            samples: vec![],
+        };
         assert_eq!(mk(71.0).file_name(), "Test Loop - 71 BPM.wav");
         assert_eq!(mk(92.5).file_name(), "Test Loop - 92.5 BPM.wav");
     }

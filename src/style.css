@@ -1,0 +1,533 @@
+/*
+ * Tempo Sampler: light content on a dark frame (admin-style).
+ *
+ * Tokens (vizia CSS has no variables, so they're written out):
+ *   frame        #0b0b0b   window background and sidebar
+ *   frame text   #e3e3e3   sidebar primary     muted #8a8a8a
+ *   frame hover  #1c1c1c   frame selected #262626   frame input #151515 / border #262626
+ *   sheet        #f1f1f1   content surface, off-white
+ *   card         #ffffff   white cards on the sheet, for depth
+ *   ink          #303030   primary text        strong #1a1a1a
+ *   secondary    #616161   muted #8a8a8a       disabled #c4c4c4
+ *   hairline     #e3e3e3   fill #f6f6f6 (waveform frames)   track #f1f1f1
+ *   focus        #005bd3   playhead
+ *
+ * Grid (layered, 2026-11-25):
+ *   1. Base grid 8px. Every size, gap and padding is a multiple of 8; 4 is a
+ *      half step used only inside controls (segmented track, label pairs).
+ *      Exceptions: 1px hairlines, the 4px dark frame around the sheet.
+ *   2. Safe space. Sheet and cards: 24px radius, 24px inset. Inside a card,
+ *      groups are 16px apart; items within a group 8px.
+ *   3. Structure. Nested radii step down: card 24, tile 16, waveform frame 8.
+ *      Buttons, fields and toggles are fully round (half their height:
+ *      32 → 16, 40 → 20, 24 → 12).
+ *   4. Type. One family, Inter. Sizes 11 / 13 / 14 / 32 and two weights
+ *      (regular, bold); no component uses more than three sizes:
+ *        sidebar   14 bold (app name) · 13 (rows, nav, search) · 11 (meta, counts, headers)
+ *        header    32 bold (title, wraps between words) · 13 (details)
+ *        cards     14 bold (card titles) · 13 (controls) · 11 (tile labels)
+ *
+ * Alignment lines (gridlines pass; constants in editor.rs):
+ *   Sidebar  box line 0 (search, row highlights, logo); icon column 8..24
+ *            (16px icons); text line 32 (labels, placeholder, app name);
+ *            section header on the icon column's left edge; each nesting
+ *            level moves icon and text by one column (24px); counts end 8px
+ *            in from a row's right edge.
+ *   Sheet    box lines = sheet padding (cards); text lines 24px further in
+ *            (card padding): the title, details and card contents share them.
+ *            Leading icons (.lead-icon) are pulled 2px out so their ink, not
+ *            their box, sits on the text line.
+ */
+
+:root {
+  background-color: #0b0b0b;
+  color: #303030;
+  font-family: "Inter";
+  font-size: 13;
+  font-weight: regular;
+}
+
+label {
+  color: #303030;
+}
+
+icon {
+  font-family: "tabler-icons";
+  size: 16px;
+  font-size: 15;
+  color: #616161;
+}
+
+/* ================= Sidebar (dark) ================= */
+
+.sidebar {
+  width: 304px;
+  child-top: 16px;
+  child-left: 8px;
+  child-right: 8px;
+  child-bottom: 8px;
+  row-between: 8px;
+}
+.sidebar label {
+  color: #e3e3e3;
+}
+.sidebar icon {
+  color: #a3a3a3;
+}
+
+.brand label {
+  font-size: 14;
+  font-weight: bold;
+  color: #ffffff;
+}
+.brand-mark {
+  size: 24px;
+  border-radius: 8px;
+  background-image: linear-gradient(to bottom, #ffffff, #d9d9d9);
+  box-shadow: 0px 1px 3px #00000099, inset 0px -1px 0px #0000001f;
+}
+.brand-mark icon {
+  color: #0b0b0b;
+}
+
+.search {
+  height: 32px;
+  background-color: #151515;
+  border-width: 1px;
+  border-color: #262626;
+  border-radius: 16px;
+  box-shadow: inset 0px 1px 3px #000000b3, 0px 1px 0px #ffffff0a;
+}
+.search textbox {
+  height: 30px;
+  background-color: #00000000;
+  border-width: 0px;
+  child-left: 0px;
+  color: #ffffff;
+}
+.search textbox label {
+  color: #e3e3e3;
+}
+.search textbox > label.placeholder {
+  color: #7a7a7a;
+  child-left: 0px;
+}
+.search textbox .caret {
+  background-color: #ffffff;
+}
+.search textbox .selection {
+  background-color: #ffffff40;
+}
+
+.section-label label {
+  font-size: 11;
+  color: #8a8a8a;
+}
+.count {
+  font-size: 11;
+  color: #6b6b6b;
+  width: auto;
+}
+
+virtual_list {
+  background-color: #00000000;
+}
+/* Rows span the list's full width, lining up with the search box. vizia's
+   scroll content leaves a gap on the right otherwise, so set it outright:
+   the sidebar's 304px less its 8px + 8px padding. */
+virtual_list scroll_content > vstack {
+  width: 288px;
+}
+
+press-drag.row {
+  background-color: #00000000;
+  border-radius: 8px;
+  overflow: hidden;
+}
+press-drag.row:over {
+  background-color: #1c1c1c;
+}
+press-drag.row:checked {
+  background-color: #262626;
+  border-width: 1px;
+  border-color: #ffffff14;
+  box-shadow: 0px 1px 3px #00000099, inset 0px 1px 0px #ffffff0d;
+}
+press-drag.row .name {
+  font-size: 13;
+  color: #e3e3e3;
+}
+press-drag.row .meta {
+  font-size: 11;
+  color: #8a8a8a;
+}
+press-drag.row:checked .name {
+  color: #ffffff;
+}
+press-drag.row.folder .name {
+  font-weight: bold;
+  color: #e3e3e3;
+}
+press-drag.row icon {
+  color: #8a8a8a;
+}
+press-drag.row .folder-count {
+  font-size: 11;
+  color: #8a8a8a;
+}
+/* Fades over cut-off text, in the colour behind it. */
+.fade {
+  background-image: linear-gradient(to right, #0b0b0b00, #0b0b0b);
+}
+press-drag.row:over .fade {
+  background-image: linear-gradient(to right, #1c1c1c00, #1c1c1c);
+}
+press-drag.row:checked .fade {
+  background-image: linear-gradient(to right, #26262600, #262626);
+}
+press-drag.row.muted .name,
+press-drag.row.muted .meta {
+  color: #5a5a5a;
+}
+
+/* Sidebar actions look like nav items. */
+.nav-item {
+  height: 32px;
+  background-color: #00000000;
+  border-width: 0px;
+  border-radius: 16px;
+  col-between: 8px;
+  box-shadow: 0px 0px 0px #00000000;
+  child-right: 1s;
+}
+.nav-item:over {
+  background-color: #1c1c1c;
+}
+.nav-item label {
+  color: #e3e3e3;
+  font-weight: regular;
+}
+.nav-group {
+  row-between: 0px;
+  height: auto;
+}
+
+.folder-list {
+  child-left: 8px;
+  row-between: 0px;
+}
+.folder-list label {
+  font-size: 11;
+  color: #8a8a8a;
+}
+
+.muted {
+  font-size: 11;
+  color: #8a8a8a;
+}
+
+scrollview scrollbar {
+  background-color: #00000000;
+}
+scrollview scrollbar.vertical {
+  width: 8px;
+}
+scrollview scrollbar .thumb {
+  background-color: #3a3a3a;
+  border-radius: 4px;
+}
+
+/* ================= Sheet (light) ================= */
+
+.sheet {
+  background-color: #f1f1f1;
+  border-radius: 24px;
+  child-space: 24px;
+  row-between: 24px;
+}
+
+.page-title {
+  font-size: 32;
+  font-weight: bold;
+  color: #1a1a1a;
+}
+.subdued {
+  font-size: 13;
+  color: #616161;
+}
+
+/* Buttons */
+button {
+  height: 32px;
+  background-color: #ffffff;
+  border-width: 1px;
+  border-color: #dedede;
+  border-radius: 16px;
+  box-shadow: 0px 1px 0px #00000012, 0px 1px 2px #0000000d, inset 0px -1px 0px #0000000f;
+  transition: background-color 100ms;
+}
+button label {
+  font-size: 13;
+  color: #303030;
+  font-weight: bold;
+}
+button icon {
+  color: #303030;
+}
+button:over {
+  background-color: #f6f6f6;
+}
+button:active {
+  background-color: #f1f1f1;
+  box-shadow: inset 0px 1px 2px #0000001f;
+}
+
+/* Small round icon-only button (Show in Finder beside the title). */
+button.icon-button {
+  size: 32px;
+  child-space: 1s;
+  border-radius: 16px;
+  background-color: #00000000;
+  border-color: #00000000;
+  box-shadow: 0px 0px 0px #00000000;
+}
+button.icon-button:over {
+  background-color: #e3e3e3;
+}
+button.icon-button icon {
+  color: #616161;
+}
+
+/* "Whole song": hold to play, like a tile. Raised while it's the selection. */
+.whole-song {
+  height: 32px;
+  width: auto;
+  border-width: 1px;
+  border-color: #00000000;
+  border-radius: 16px;
+  child-left: 16px;
+  child-right: 16px;
+  child-top: 1s;
+  child-bottom: 1s;
+}
+.card-title .whole-song label {
+  font-size: 13;
+  font-weight: regular;
+  color: #616161;
+}
+.whole-song:over {
+  background-color: #f1f1f1;
+}
+.whole-song:checked {
+  background-color: #ffffff;
+  border-color: #00000014;
+  box-shadow: 0px 1px 2px #00000024, 0px 2px 6px #0000000f;
+}
+.card-title .whole-song:checked label {
+  color: #303030;
+  font-weight: bold;
+}
+
+/* Segmented control: grey track (32 tall), raised white selection (24). */
+.segmented {
+  height: 32px;
+  width: auto;
+  background-color: #f1f1f1;
+  box-shadow: inset 0px 1px 2px #0000000f, inset 0px 0px 0px 1px #e6e6e6;
+  border-radius: 16px;
+  child-space: 4px;
+  col-between: 4px;
+}
+.segmented button {
+  height: 24px;
+  child-left: 12px;
+  child-right: 12px;
+  background-color: #00000000;
+  border-width: 0px;
+  border-radius: 12px;
+  box-shadow: 0px 0px 0px #00000000;
+}
+.segmented button label {
+  color: #616161;
+  font-weight: regular;
+}
+.segmented button:over label {
+  color: #303030;
+}
+.segmented button:checked {
+  background-color: #ffffff;
+  box-shadow: 0px 1px 2px #00000024, 0px 2px 6px #0000000f;
+}
+.segmented button:checked label {
+  color: #303030;
+  font-weight: bold;
+}
+
+/* Stem on/off buttons (40 tall): sunken when off, raised with a lit
+   indicator when on. */
+.stem {
+  border-width: 1px;
+  border-radius: 20px;
+  transition: background-color 100ms;
+  background-color: #f3f3f3;
+  border-color: #e2e2e2;
+  box-shadow: inset 0px 1px 3px #00000014;
+}
+.stem:over {
+  background-color: #efefef;
+}
+.stem:checked {
+  background-color: #ffffff;
+  border-color: #d6d6d6;
+  box-shadow: 0px 1px 2px #00000017, 0px 3px 10px #0000000f, inset 0px 1px 0px #ffffff;
+}
+.stem:checked:over {
+  background-color: #fcfcfc;
+}
+.stem .stem-name {
+  font-size: 13;
+  font-weight: regular;
+  color: #8a8a8a;
+}
+.stem:checked .stem-name {
+  color: #1a1a1a;
+  font-weight: bold;
+}
+/* Indicator lights: hollow when off, glowing in the stem's colour when on. */
+.led {
+  size: 8px;
+  border-radius: 4px;
+  border-width: 1px;
+  border-color: #c2c2c2;
+  background-color: #e9e9e9;
+  box-shadow: inset 0px 1px 1px #0000001f;
+}
+.stem:checked .led.drums {
+  background-color: #f49342;
+  border-color: #d9772a;
+  box-shadow: 0px 0px 6px #f49342aa;
+}
+.stem:checked .led.bass {
+  background-color: #8b6cf0;
+  border-color: #6f50d6;
+  box-shadow: 0px 0px 6px #8b6cf0aa;
+}
+.stem:checked .led.other {
+  background-color: #23a6a6;
+  border-color: #168a8a;
+  box-shadow: 0px 0px 6px #23a6a6aa;
+}
+.stem:checked .led.vocals {
+  background-color: #e8559a;
+  border-color: #c93c7e;
+  box-shadow: 0px 0px 6px #e8559aaa;
+}
+
+/* Not split yet: everything flat and faint. */
+.stem.disabled {
+  background-color: #f6f6f6;
+  border-color: #ececec;
+  box-shadow: 0px 0px 0px #00000000;
+}
+.stem.disabled .stem-name {
+  color: #c4c4c4;
+}
+.stem.disabled .led {
+  background-color: #f1f1f1;
+  border-color: #dcdcdc;
+  box-shadow: 0px 0px 0px #00000000;
+}
+
+/* Cards: 24 radius, 24 inset. The edge is drawn by shadows (no border) so
+   the inset is exactly 24 and content lands on the grid. */
+.card {
+  background-color: #ffffff;
+  border-radius: 24px;
+  box-shadow: 0px 0px 1px #00000040, 0px 1px 2px #0000000f, 0px 8px 16px #0000000a;
+  child-space: 24px;
+  row-between: 16px;
+}
+.card-title {
+  height: 32px;
+}
+.card-title label {
+  font-size: 14;
+  font-weight: bold;
+  color: #303030;
+}
+.card-title icon {
+  color: #303030;
+}
+/* Leading icons in the sheet's text rows: the glyph sits ~2px inside its
+   16px box, so pull the box out to put the ink on the text line. */
+.lead-icon {
+  left: -2px;
+}
+.card-title .note {
+  font-size: 13;
+  font-weight: regular;
+  color: #8a8a8a;
+}
+
+/* Chop tiles: 16 radius inside the 24 card, 8 inset. */
+chop-tile {
+  background-color: #ffffff;
+  border-width: 1px;
+  border-color: #e6e6e6;
+  box-shadow: 0px 1px 2px #0000000d;
+  border-radius: 16px;
+  child-space: 8px;
+  row-between: 8px;
+  transition: background-color 100ms;
+}
+chop-tile:over {
+  border-color: #d2d2d2;
+  box-shadow: 0px 2px 8px #00000014, 0px 1px 2px #0000000f;
+}
+chop-tile:checked {
+  background-color: #ffffff;
+  border-width: 2px;
+  border-color: #1a1a1a;
+  box-shadow: 0px 4px 16px #0000001f, 0px 1px 3px #00000014;
+}
+/* Recessed panel framing each waveform: 8 radius. The waveform runs to the
+   panel's side edges; 8 above and below. */
+.wave-frame {
+  background-color: #f6f6f6;
+  border-width: 1px;
+  border-color: #e9e9e9;
+  border-radius: 8px;
+  box-shadow: inset 0px 1px 2px #0000000d;
+  child-left: 0px;
+  child-right: 0px;
+  child-top: 8px;
+  child-bottom: 8px;
+}
+chop-tile:over .wave-frame {
+  background-color: #f2f2f2;
+}
+chop-tile:checked .wave-frame {
+  background-color: #f1f1f1;
+  border-color: #e0e0e0;
+}
+
+chop-tile label {
+  font-size: 11;
+  color: #616161;
+}
+
+/* Feedback from the last action, bottom of the sheet. */
+.status-line {
+  font-size: 11;
+  color: #8a8a8a;
+  left: 1s;
+  right: 1s;
+}
+
+.empty-state label {
+  color: #616161;
+}
+
+.hidden {
+  display: none;
+}

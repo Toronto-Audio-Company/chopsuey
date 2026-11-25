@@ -1,0 +1,146 @@
+//! Shared spectral analysis.
+
+use rustfft::{num_complex::Complex, FftPlanner};
+
+/// 10 ms analysis hop.
+pub fn hop_size(sample_rate: u32) -> usize {
+    (sample_rate as usize / 100).max(1)
+}
+
+/// ~21 ms window: 1024 samples at 44.1/48 kHz.
+pub fn fft_size(sample_rate: u32) -> usize {
+    ((sample_rate as f32 * 0.021) as usize).next_power_of_two().max(256)
+}
+
+/// Runs a Hann-windowed STFT over `mono` (frame `f` starts at `f * hop`) and
+/// calls `per_frame(f, log_mags)` with compressed magnitudes
+/// `ln(1 + 100·|X|)` for bins 0..=n_fft/2. Bin `k` is `k · sr / n_fft` Hz.
+pub fn stft_log_mags(mono: &[f32], sample_rate: u32, hop: usize, mut per_frame: impl FnMut(usize, &[f32])) {
+    let n_fft = fft_size(sample_rate);
+    let window: Vec<f32> = (0..n_fft)
+        .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n_fft as f32).cos())
+        .collect();
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(n_fft);
+    let bins = n_fft / 2 + 1;
+    let mut buf = vec![Complex::new(0.0f32, 0.0); n_fft];
+    let mut mag = vec![0.0f32; bins];
+    for f in 0..mono.len() / hop {
+        let start = f * hop;
+        for (i, b) in buf.iter_mut().enumerate() {
+            let x = mono.get(start + i).copied().unwrap_or(0.0);
+            *b = Complex::new(x * window[i], 0.0);
+        }
+        fft.process(&mut buf);
+        for (m, c) in mag.iter_mut().zip(&buf[..bins]) {
+            *m = (1.0 + 100.0 * c.norm()).ln();
+        }
+        per_frame(f, &mag);
+    }
+}
+
+/// Subtracts a centred moving average (±`half` frames), removing slow
+/// loudness trends so only short-term changes remain.
+pub fn detrend(x: &[f32], half: usize) -> Vec<f32> {
+    let n = x.len();
+    let mut prefix = vec![0.0f64; n + 1];
+    for i in 0..n {
+        prefix[i + 1] = prefix[i] + x[i] as f64;
+    }
+    (0..n)
+        .map(|i| {
+            let (a, b) = (i.saturating_sub(half), (i + half + 1).min(n));
+            x[i] - ((prefix[b] - prefix[a]) / (b - a) as f64) as f32
+        })
+        .collect()
+}
+
+/// Resamples interleaved stereo with a windowed-sinc (Blackman) filter.
+/// Polyphase table, ±32 taps (wider when downsampling), anti-aliased at
+/// 95% of the lower Nyquist. Quality is well past what stem separation or
+/// time-stretching can resolve.
+pub fn resample_stereo(x: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if from == to || x.is_empty() {
+        return x.to_vec();
+    }
+    const PHASES: usize = 2048;
+    let ratio = to as f64 / from as f64;
+    let fc = ratio.min(1.0) * 0.95; // cutoff, relative to the input Nyquist
+    let half = (32.0 / ratio.min(1.0)).ceil() as isize;
+    let taps = 2 * half as usize;
+
+    // table[p][j]: weight of input sample (floor(t) - half + 1 + j) for an
+    // output at fractional input position frac = p / PHASES.
+    let sinc = |x: f64| if x.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+    let blackman = |u: f64| {
+        if u.abs() >= 1.0 {
+            0.0
+        } else {
+            0.42 + 0.5 * (std::f64::consts::PI * u).cos() + 0.08 * (2.0 * std::f64::consts::PI * u).cos()
+        }
+    };
+    let mut table = vec![0.0f32; PHASES * taps];
+    for p in 0..PHASES {
+        let frac = p as f64 / PHASES as f64;
+        let row: Vec<f64> = (0..taps)
+            .map(|j| {
+                let d = frac + (half - 1) as f64 - j as f64;
+                fc * sinc(fc * d) * blackman(d / half as f64)
+            })
+            .collect();
+        let sum: f64 = row.iter().sum();
+        for (j, v) in row.iter().enumerate() {
+            table[p * taps + j] = (v / sum) as f32;
+        }
+    }
+
+    let n_in = (x.len() / 2) as isize;
+    let n_out = ((x.len() / 2) as f64 * ratio).round() as usize;
+    let mut out = vec![0.0f32; n_out * 2];
+    for n in 0..n_out {
+        let t = n as f64 / ratio;
+        let base = t.floor() as isize;
+        let p = (((t - base as f64) * PHASES as f64) as usize).min(PHASES - 1);
+        let row = &table[p * taps..(p + 1) * taps];
+        let start = base - half + 1;
+        let (mut l, mut r) = (0.0f32, 0.0f32);
+        for (j, &w) in row.iter().enumerate() {
+            let k = start + j as isize;
+            if k >= 0 && k < n_in {
+                l += x[2 * k as usize] * w;
+                r += x[2 * k as usize + 1] * w;
+            }
+        }
+        out[2 * n] = l;
+        out[2 * n + 1] = r;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampling_keeps_frequency_and_level() {
+        let tone = |sr: u32, secs: f32| -> Vec<f32> {
+            (0..(sr as f32 * secs) as usize)
+                .flat_map(|i| {
+                    let s = (std::f32::consts::TAU * 1000.0 * i as f32 / sr as f32).sin() * 0.5;
+                    [s, s]
+                })
+                .collect()
+        };
+        let x = tone(48_000, 1.0);
+        let y = resample_stereo(&x, 48_000, 44_100);
+        assert_eq!(y.len() / 2, 44_100);
+        let expected = tone(44_100, 1.0);
+        // Compare away from the edges.
+        let err = y[2000..86000].iter().zip(&expected[2000..86000]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 0.003, "max error {err}");
+        // Round trip.
+        let back = resample_stereo(&y, 44_100, 48_000);
+        assert_eq!(back.len(), x.len());
+        let err = back[4000..90000].iter().zip(&x[4000..90000]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 0.005, "round-trip max error {err}");
+    }
+}
