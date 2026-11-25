@@ -126,16 +126,13 @@ icon {
   width: auto;
 }
 
-virtual_list {
-  background-color: #00000000;
-}
 /* Rows span the list's full width, lining up with the search box. vizia's
    scroll content leaves a gap on the right otherwise, so set it outright:
    the sidebar's 304px less its 8px + 8px padding. Pinning the content too
    means nothing can make it wider than the list, which would let it scroll
    sideways. */
-virtual_list scroll_content,
-virtual_list scroll_content > vstack {
+.row-list scroll_content,
+.row-list scroll_content > vstack {
   width: 288px;
 }
 
@@ -146,6 +143,13 @@ press-drag.row {
 }
 press-drag.row:over {
   background-color: #1c1c1c;
+}
+/* A row's folder and sample layouts swap with the class .hidden as the
+   row view is reused for other rows. vizia only restyles a view that
+   matches at least one rule, so without this one a layout that lost
+   .hidden would keep display: none. */
+.row-variant {
+  background-color: #00000000;
 }
 press-drag.row:checked {
   background-color: #262626;

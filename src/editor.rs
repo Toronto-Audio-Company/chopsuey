@@ -80,9 +80,30 @@ struct AppData {
     /// marquee). By key, not position: rows move while tempos are detected.
     #[lens(ignore)]
     hover: Option<(String, std::time::Instant)>,
+    /// The row-list slot the mouse is over (see `RowList`).
+    #[lens(ignore)]
+    hover_slot: Option<usize>,
+    /// Row-list scroll position, as vizia's ScrollView reports it (0..1 of
+    /// the scrollable distance), and its visible height in logical px.
+    #[lens(ignore)]
+    list_scroll_y: f32,
+    #[lens(ignore)]
+    list_view_h: f32,
+    /// Row views in the list: enough to cover its height plus one partial row.
+    list_slots: usize,
+    /// The list's ScrollView (known once it has reported a scroll), to move it.
+    #[lens(ignore)]
+    list_scroll: Option<Entity>,
+    /// Row count the scroll position was last set for.
+    #[lens(ignore)]
+    list_len: usize,
+    /// The next change to the rows should start the list at the top (a new
+    /// search or filter) rather than keep the rows on screen where they are.
+    #[lens(ignore)]
+    list_to_top: bool,
 }
 
-#[derive(Clone, Data, Lens)]
+#[derive(Clone, Default, Data, Lens)]
 struct Row {
     /// Sample key, or the folder path for folder rows.
     key: String,
@@ -118,7 +139,11 @@ enum AppEvent {
     WholeSong,
     RefreshRows,
     Search(String),
-    Select(usize),
+    /// Press on row-list slot n (whichever row it shows right now).
+    SelectSlot(usize),
+    /// The row list scrolled or changed size: scroll fraction, visible
+    /// height (logical px) and the ScrollView.
+    ListScrolled { y: f32, view_h: f32, scroll: Entity },
     /// The ½× / 1× / 2× tempo choice for the selected sample.
     SetTempoScale(f32),
     AddFolder,
@@ -133,15 +158,38 @@ enum AppEvent {
     ToggleFavouritesOnly,
     /// The mouse was let go: previews play only while held.
     StopPreview,
-    /// The mouse entered / left sidebar row n (for the name marquee).
-    HoverRow(usize),
-    UnhoverRow(usize),
+    /// The mouse entered / left row-list slot n (for the name marquee).
+    HoverSlot(usize),
+    UnhoverSlot(usize),
     ShowInFinder,
     /// Drag after pressing a row or tile (only if the press selected it).
     StartDrag,
 }
 
 impl AppData {
+    /// Index of the first row in the list's viewport.
+    fn first_row(&self) -> usize {
+        let content = self.rows.len() as f32 * ROW_HEIGHT;
+        let offset = (content - self.list_view_h).max(0.0) * self.list_scroll_y;
+        (offset / ROW_HEIGHT).floor() as usize
+    }
+
+    /// The row slot `slot` shows: of the rows in view (the first
+    /// `list_slots` from `first_row`), the one whose index is `slot` modulo
+    /// the slot count. Scrolling by a row so only re-points the one slot
+    /// that went off one edge to the row coming in at the other. None past
+    /// the last row.
+    fn slot_row_index(&self, slot: usize) -> Option<usize> {
+        let n = self.list_slots.max(1);
+        let first = self.first_row();
+        let i = first + (slot + n - first % n) % n;
+        (i < self.rows.len()).then_some(i)
+    }
+
+    fn slot_row(&self, slot: usize) -> Option<&Row> {
+        self.slot_row_index(slot).and_then(|i| self.rows.get(i))
+    }
+
     fn rebuild_rows(&mut self) {
         let needle = self.search.trim().to_lowercase();
         let st = self.shared.library.state.lock().unwrap();
@@ -434,10 +482,20 @@ impl Model for AppData {
             }
             AppEvent::Search(text) => {
                 self.search = text.clone();
+                self.list_to_top = true;
                 self.rebuild_rows();
             }
-            AppEvent::Select(index) => {
-                let Some(row) = self.rows.get(*index) else { return };
+            AppEvent::ListScrolled { y, view_h, scroll } => {
+                self.list_scroll_y = *y;
+                self.list_view_h = *view_h;
+                self.list_scroll = Some(*scroll);
+                let slots = (*view_h / ROW_HEIGHT).ceil() as usize + 1;
+                if slots != self.list_slots {
+                    self.list_slots = slots;
+                }
+            }
+            AppEvent::SelectSlot(slot) => {
+                let Some(row) = self.slot_row(*slot) else { return };
                 let key = row.key.clone();
                 if row.is_folder {
                     // Open or close the folder; never a drag source.
@@ -494,20 +552,23 @@ impl Model for AppData {
             }
             AppEvent::ToggleFavouritesOnly => {
                 self.favourites_only = !self.favourites_only;
+                self.list_to_top = true;
                 self.rebuild_rows();
             }
             AppEvent::StopPreview => {
                 self.shared.preview.store(false, Ordering::Relaxed);
             }
-            AppEvent::HoverRow(i) => {
-                if let Some(row) = self.rows.get(*i) {
+            AppEvent::HoverSlot(slot) => {
+                if let Some(row) = self.slot_row(*slot) {
                     self.hover = Some((row.key.clone(), std::time::Instant::now()));
+                    self.hover_slot = Some(*slot);
                 }
             }
-            AppEvent::UnhoverRow(i) => {
-                let key = self.rows.get(*i).map(|r| &r.key);
-                if self.hover.as_ref().is_some_and(|(h, _)| Some(h) == key) {
+            AppEvent::UnhoverSlot(slot) => {
+                // Leaving one row can arrive after entering the next.
+                if self.hover_slot == Some(*slot) {
                     self.hover = None;
+                    self.hover_slot = None;
                 }
             }
             AppEvent::Audition => {
@@ -538,6 +599,31 @@ impl Model for AppData {
                 };
             }
         });
+        self.keep_list_position(cx);
+    }
+}
+
+impl AppData {
+    /// vizia's ScrollView remembers its position as a fraction of the
+    /// scrollable distance, so when rows come or go (a folder opens, a scan
+    /// adds files) the list would slide. Keep the rows on screen where they
+    /// were instead, or go back to the top for a new search or filter.
+    fn keep_list_position(&mut self, cx: &mut EventContext) {
+        let len = self.rows.len();
+        if len == self.list_len && !self.list_to_top {
+            return;
+        }
+        let span = |n: usize| (n as f32 * ROW_HEIGHT - self.list_view_h).max(0.0);
+        let offset = span(self.list_len) * self.list_scroll_y;
+        let y = if self.list_to_top || span(len) == 0.0 { 0.0 } else { (offset / span(len)).min(1.0) };
+        self.list_len = len;
+        self.list_to_top = false;
+        if y != self.list_scroll_y {
+            self.list_scroll_y = y;
+            if let Some(scroll) = self.list_scroll {
+                cx.emit_to(scroll, ScrollEvent::SetY(y));
+            }
+        }
     }
 }
 
@@ -663,6 +749,13 @@ pub(crate) fn create(
             hover: std::env::var("TEMPO_SAMPLER_DEMO_HOVER")
                 .ok()
                 .map(|key| (key, std::time::Instant::now())),
+            hover_slot: None,
+            list_scroll_y: 0.0,
+            list_view_h: 0.0,
+            list_slots: 0,
+            list_scroll: None,
+            list_len: 0,
+            list_to_top: false,
             toggled_folders: Default::default(),
             sample_count: 0,
             message: String::new(),
@@ -767,7 +860,7 @@ fn set_param<P: nih_plug::prelude::Param>(cx: &mut EventContext, param: &P, valu
 
 /// A sidebar row's name, clipped to the row. While the row is hovered, a
 /// name that doesn't fit scrolls to show the rest, car-stereo style.
-fn marquee_name<L: Lens<Target = String>>(cx: &mut Context, name: L, index: usize) {
+fn marquee_name<L: Lens<Target = String>>(cx: &mut Context, name: L, slot: usize) {
     HStack::new(cx, |cx| {
         Label::new(cx, name)
             .class("name")
@@ -775,7 +868,7 @@ fn marquee_name<L: Lens<Target = String>>(cx: &mut Context, name: L, index: usiz
             .text_wrap(false)
             .hoverable(false)
             // Translation moves only the drawing, not the layout.
-            .translate(AppData::root.map(move |d| Translate::new(Length::px(-marquee_x(d, index)), Length::px(0.0))));
+            .translate(AppData::root.map(move |d| Translate::new(Length::px(-marquee_x(d, slot)), Length::px(0.0))));
         // While scrolled, the start is cut off too: fade that edge like the
         // end. Shown only while the name is scrolled away from its start.
         Element::new(cx)
@@ -785,7 +878,7 @@ fn marquee_name<L: Lens<Target = String>>(cx: &mut Context, name: L, index: usiz
             .top(Pixels(0.0))
             .width(Pixels(24.0))
             .height(Percentage(100.0))
-            .toggle_class("hidden", AppData::root.map(move |d| marquee_x(d, index) < 1.0))
+            .toggle_class("hidden", AppData::root.map(move |d| marquee_x(d, slot) < 1.0))
             .hoverable(false);
     })
     .width(Stretch(1.0))
@@ -795,10 +888,10 @@ fn marquee_name<L: Lens<Target = String>>(cx: &mut Context, name: L, index: usiz
     .hoverable(false);
 }
 
-/// How far row `index`'s name is scrolled right now (0 unless hovered and
-/// too long to fit).
-fn marquee_x(d: &AppData, index: usize) -> f32 {
-    match (&d.hover, d.rows.get(index)) {
+/// How far the name in row-list slot `slot` is scrolled right now (0
+/// unless hovered and too long to fit).
+fn marquee_x(d: &AppData, slot: usize) -> f32 {
+    match (&d.hover, d.slot_row(slot)) {
         (Some((key, since)), Some(row)) if *key == row.key => marquee_offset(row.overflow, since.elapsed().as_secs_f32()),
         _ => 0.0,
     }
@@ -847,7 +940,7 @@ fn text_width(text: &str, size: f32, bold: bool) -> f32 {
 /// How far a row's name must scroll to show its end clear of the fade
 /// (0 if it fits). Widths follow the row layout in `sidebar`.
 fn name_overflow(row: &Row) -> f32 {
-    const LIST: f32 = 288.0; // style.css `virtual_list ... vstack`
+    const LIST: f32 = 288.0; // style.css `.row-list ... vstack`
     const FADE: f32 = 24.0;
     let depth = row.depth as f32 * INDENT;
     let room = if row.is_folder {
@@ -871,6 +964,106 @@ fn fade(cx: &mut Context) {
         .left(Pixels(-24.0))
         .height(Stretch(1.0))
         .hoverable(false);
+}
+
+/// Lens to the row that row-list slot `n` shows (see
+/// `AppData::slot_row_index`), by reference so bindings clone nothing
+/// unless it changed. Slots past the last row see an empty row (and are
+/// hidden).
+#[derive(Clone, Copy, Debug)]
+struct SlotRow(usize);
+
+impl std::hash::Hash for SlotRow {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Bindings share a store per lens hash: keep ours distinct.
+        std::any::TypeId::of::<Self>().hash(state);
+        self.0.hash(state);
+    }
+}
+
+impl Lens for SlotRow {
+    type Source = AppData;
+    type Target = Row;
+
+    fn view<O, F: FnOnce(Option<&Row>) -> O>(&self, data: &AppData, map: F) -> O {
+        static EMPTY: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
+        map(Some(data.slot_row(self.0).unwrap_or_else(|| EMPTY.get_or_init(Row::default))))
+    }
+}
+
+/// Row view for row-list slot `slot`: shows whichever row
+/// `AppData::slot_row_index` puts in that slot, at that row's position.
+fn list_row(cx: &mut Context, slot: usize) {
+    let row = SlotRow(slot);
+    // Folders: press to open/close. Samples: press to select and
+    // audition, press and drag to drag it out.
+    let indent = row.then(Row::depth).map(|d| Pixels(ICON_COLUMN + *d as f32 * INDENT));
+    PressDrag::new(cx, AppEvent::SelectSlot(slot), move |cx| {
+        // Folder variant
+        // The icon opens and closes with the folder (no separate
+        // chevron), so the icon column and text line stay clear.
+        centred(HStack::new(cx, |cx| {
+            Icon::new(
+                cx,
+                row.then(Row::expanded).map(|e| if *e { ICON_FOLDER_OPEN } else { ICON_FOLDER }),
+            )
+            .hoverable(false);
+            marquee_name(cx, row.then(Row::name), slot);
+            fade(cx);
+            Label::new(cx, row.then(Row::count)).class("folder-count").hoverable(false);
+        }))
+        .class("row-variant")
+        .col_between(Pixels(ICON_GAP))
+        .child_left(indent)
+        .child_right(Pixels(ICON_COLUMN))
+        .toggle_class("hidden", row.then(Row::is_folder).map(|f| !*f))
+        .hoverable(false);
+
+        // Sample variant
+        // Labels fill the row's width (not their text's) so long
+        // names are clipped inside the highlight, under a fade.
+        HStack::new(cx, |cx| {
+            VStack::new(cx, |cx| {
+                marquee_name(cx, row.then(Row::name), slot);
+                HStack::new(cx, |cx| {
+                    Icon::new(cx, ICON_STAR_FILLED)
+                        .class("row-star")
+                        .toggle_class("hidden", row.then(Row::favourite).map(|f| !*f))
+                        .hoverable(false);
+                    Label::new(cx, row.then(Row::meta))
+                        .class("meta")
+                        .width(Stretch(1.0))
+                        .min_width(Pixels(0.0))
+                        .text_wrap(false)
+                        .overflow(Overflow::Hidden)
+                        .hoverable(false);
+                })
+                .col_between(Pixels(4.0))
+                .height(Auto)
+                .hoverable(false);
+            })
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0))
+            .row_between(Pixels(0.0))
+            .hoverable(false);
+            fade(cx);
+        })
+        .class("row-variant")
+        // No icon: the label starts on this level's text line.
+        .child_left(row.then(Row::depth).map(|d| Pixels(TEXT_LINE + *d as f32 * INDENT)))
+        .child_right(Pixels(ICON_COLUMN))
+        .toggle_class("hidden", row.then(Row::is_folder))
+        .hoverable(false);
+    })
+    .class("row")
+    .width(Percentage(100.0))
+    .toggle_class("folder", row.then(Row::is_folder))
+    .checked(row.then(Row::selected))
+    .toggle_class("muted", row.then(Row::usable).map(|u| !*u))
+    .position_type(PositionType::SelfDirected)
+    .top(AppData::root.map(move |d| Pixels(d.slot_row_index(slot).unwrap_or(0) as f32 * ROW_HEIGHT)))
+    .height(Pixels(ROW_HEIGHT))
+    .toggle_class("hidden", AppData::root.map(move |d| d.slot_row_index(slot).is_none()));
 }
 
 fn sidebar(cx: &mut Context) {
@@ -915,70 +1108,26 @@ fn sidebar(cx: &mut Context) {
         .child_right(Pixels(ICON_COLUMN))
         .height(Pixels(24.0));
 
-        VirtualList::new(cx, AppData::rows, ROW_HEIGHT, |cx, index, row| {
-            // Folders: press to open/close. Samples: press to select and
-            // audition, press and drag to drag it out.
-            let indent = row.then(Row::depth).map(|d| Pixels(ICON_COLUMN + *d as f32 * INDENT));
-            PressDrag::new(cx, AppEvent::Select(index), move |cx| {
-                // Folder variant
-                // The icon opens and closes with the folder (no separate
-                // chevron), so the icon column and text line stay clear.
-                centred(HStack::new(cx, |cx| {
-                    Icon::new(
-                        cx,
-                        row.then(Row::expanded).map(|e| if *e { ICON_FOLDER_OPEN } else { ICON_FOLDER }),
-                    )
-                    .hoverable(false);
-                    marquee_name(cx, row.then(Row::name), index);
-                    fade(cx);
-                    Label::new(cx, row.then(Row::count)).class("folder-count").hoverable(false);
-                }))
-                .col_between(Pixels(ICON_GAP))
-                .child_left(indent)
-                .child_right(Pixels(ICON_COLUMN))
-                .toggle_class("hidden", row.then(Row::is_folder).map(|f| !*f))
-                .hoverable(false);
-
-                // Sample variant
-                // Labels fill the row's width (not their text's) so long
-                // names are clipped inside the highlight, under a fade.
-                HStack::new(cx, |cx| {
-                    VStack::new(cx, |cx| {
-                        marquee_name(cx, row.then(Row::name), index);
-                        HStack::new(cx, |cx| {
-                            Icon::new(cx, ICON_STAR_FILLED)
-                                .class("row-star")
-                                .toggle_class("hidden", row.then(Row::favourite).map(|f| !*f))
-                                .hoverable(false);
-                            Label::new(cx, row.then(Row::meta))
-                                .class("meta")
-                                .width(Stretch(1.0))
-                                .min_width(Pixels(0.0))
-                                .text_wrap(false)
-                                .overflow(Overflow::Hidden)
-                                .hoverable(false);
-                        })
-                        .col_between(Pixels(4.0))
-                        .height(Auto)
-                        .hoverable(false);
-                    })
-                    .child_top(Stretch(1.0))
-                    .child_bottom(Stretch(1.0))
-                    .row_between(Pixels(0.0))
-                    .hoverable(false);
-                    fade(cx);
-                })
-                // No icon: the label starts on this level's text line.
-                .child_left(row.then(Row::depth).map(|d| Pixels(TEXT_LINE + *d as f32 * INDENT)))
-                .child_right(Pixels(ICON_COLUMN))
-                .toggle_class("hidden", row.then(Row::is_folder))
-                .hoverable(false);
+        // The library list. vizia's VirtualList rebuilds every visible row
+        // each time the list scrolls past a row boundary, which made
+        // scrolling stutter; this keeps a fixed set of row views and only
+        // re-points the one that scrolls off an edge (see `slot_row_index`).
+        ScrollView::new(cx, 0.0, 0.0, false, true, |cx| {
+            VStack::new(cx, |cx| {
+                Binding::new(cx, AppData::list_slots, |cx, slots| {
+                    for slot in 0..slots.get(cx) {
+                        list_row(cx, slot);
+                    }
+                });
             })
-            .class("row")
-            .width(Percentage(100.0))
-            .toggle_class("folder", row.then(Row::is_folder))
-            .checked(row.then(Row::selected))
-            .toggle_class("muted", row.then(Row::usable).map(|u| !*u))
+            .height(AppData::rows.map(|rows| Pixels(rows.len() as f32 * ROW_HEIGHT)));
+        })
+        .class("row-list")
+        .scroll_to_cursor(true)
+        .on_scroll(|cx, _, y| {
+            let view_h = cx.bounds().h / cx.scale_factor();
+            let scroll = cx.current();
+            cx.emit(AppEvent::ListScrolled { y, view_h, scroll });
         })
         .height(Stretch(1.0));
 
@@ -1769,10 +1918,10 @@ impl View for PressDrag {
     }
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-        if let AppEvent::Select(i) = self.on_press {
+        if let AppEvent::SelectSlot(slot) = self.on_press {
             event.map(|window_event, _| match window_event {
-                WindowEvent::MouseEnter => cx.emit(AppEvent::HoverRow(i)),
-                WindowEvent::MouseLeave => cx.emit(AppEvent::UnhoverRow(i)),
+                WindowEvent::MouseEnter => cx.emit(AppEvent::HoverSlot(slot)),
+                WindowEvent::MouseLeave => cx.emit(AppEvent::UnhoverSlot(slot)),
                 _ => {}
             });
         }
