@@ -61,4 +61,18 @@ rm -rf "$DEST/chopsuey.vst3"
 # has the same plugin ID and Live would list two copies.
 rm -rf "$DEST/Tempo Sampler.vst3"
 cp -R "$BUNDLE" "$DEST/"
+
+# The takeout box as the Finder icon, on the installed plugin and on the
+# folder dragged WAVs go to. Finder ignores icons inside .vst3 bundles, so
+# this is a custom icon like pasting one in Get Info. It's added after
+# signing, to the installed copy only: the plugin's code signature still
+# verifies (Live only checks that), only --strict objects to Finder data.
+echo "== Setting Finder icons"
+EXPORTS="$HOME/Music/chopsuey"
+mkdir -p "$EXPORTS"
+for target in "$DEST/chopsuey.vst3" "$EXPORTS"; do
+  swift scripts/icon.swift set assets/chopsuey.icns "$target" 2>/dev/null \
+    || echo "(Couldn't set the icon on $target; the plugin works without it.)"
+done
+codesign --verify "$DEST/chopsuey.vst3"
 echo "Installed. Restart Live to load the new build."

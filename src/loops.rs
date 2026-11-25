@@ -22,6 +22,49 @@ pub struct LoopAsset {
     /// Interleaved stereo samples (L, R, L, R, ...). Shared with the decoded
     /// file when this is a whole file, so selecting a song doesn't copy it.
     pub samples: Arc<Vec<f32>>,
+    /// Pitch shift applied while stretching (tempo unchanged).
+    pub pitch: Pitch,
+}
+
+/// A pitch shift like Ableton's clip Transpose and Detune: whole semitones
+/// (−48..48) plus cents (−50..50). Tempo is unaffected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Pitch {
+    pub semitones: i32,
+    pub cents: i32,
+}
+
+impl Pitch {
+    pub const NONE: Pitch = Pitch { semitones: 0, cents: 0 };
+
+    pub fn total_semitones(self) -> f32 {
+        self.semitones as f32 + self.cents as f32 / 100.0
+    }
+
+    pub fn is_none(self) -> bool {
+        self.semitones == 0 && self.cents == 0
+    }
+
+    /// " +3st", " -2st +15ct", " +20ct", or "" for no shift (file names).
+    pub fn suffix(self) -> String {
+        let mut s = String::new();
+        if self.semitones != 0 {
+            s += &format!(" {:+}st", self.semitones);
+        }
+        if self.cents != 0 {
+            s += &format!(" {:+}ct", self.cents);
+        }
+        s
+    }
+
+    /// A stretcher for stereo audio at `sample_rate`, transposing by this.
+    fn stretcher(self, sample_rate: u32) -> signalsmith_stretch::Stretch {
+        let mut st = signalsmith_stretch::Stretch::preset_default(2, sample_rate);
+        if !self.is_none() {
+            st.set_transpose_factor_semitones(self.total_semitones(), None);
+        }
+        st
+    }
 }
 
 /// A loop stretched to a particular project tempo. Same sample rate and beat
@@ -43,6 +86,7 @@ pub struct RenderedLoop {
     pub partial: bool,
     /// `key_hash(key)`, so the audio thread can check it's the wanted clip.
     pub key_hash: u64,
+    pub pitch: Pitch,
 }
 
 /// A non-zero hash of a render key (0 means "any clip" to the audio thread).
@@ -86,7 +130,14 @@ impl LoopAsset {
             is_loop,
             sample_rate,
             samples,
+            pitch: Pitch::NONE,
         }
+    }
+
+    /// The same audio (shared, not copied), transposed by `pitch`.
+    pub fn with_pitch(mut self, pitch: Pitch) -> Self {
+        self.pitch = pitch;
+        self
     }
 }
 
@@ -177,7 +228,8 @@ pub fn decode_wav<R: std::io::Read>(
 
 impl LoopAsset {
 
-    /// Stretches to `target_bpm` without changing pitch.
+    /// Stretches to `target_bpm` without changing pitch (other than by
+    /// `self.pitch`).
     ///
     /// Loops come out seamless: the loop is stretched with a short
     /// wrap-around pad on each side (its own end before it, its own start
@@ -188,7 +240,7 @@ impl LoopAsset {
         let in_frames = self.frames();
         let ratio = self.bpm as f64 / target_bpm as f64;
         let out_frames = (in_frames as f64 * ratio).round() as usize;
-        let mut stretch = signalsmith_stretch::Stretch::preset_default(2, self.sample_rate);
+        let mut stretch = self.pitch.stretcher(self.sample_rate);
 
         let samples = if self.is_loop {
             // Half a second of context each side: several times the
@@ -243,7 +295,7 @@ impl LoopAsset {
     fn stretch_stream(&self, out_frames: usize, keep: Option<usize>, cancelled: &dyn Fn() -> bool) -> Option<Vec<f32>> {
         const PIECE: usize = 16_384;
         let in_frames = self.frames();
-        let mut st = signalsmith_stretch::Stretch::preset_default(2, self.sample_rate);
+        let mut st = self.pitch.stretcher(self.sample_rate);
         let (lat_in, lat_out) = (st.input_latency(), st.output_latency());
         if out_frames < lat_out * 2 || in_frames <= lat_in {
             // Too short to split up (never a song): one go.
@@ -315,6 +367,7 @@ impl LoopAsset {
             samples,
             partial,
             key_hash: key_hash(&self.key),
+            pitch: self.pitch,
         }
     }
 }
@@ -328,11 +381,12 @@ impl RenderedLoop {
         self.frames() as f32 / self.sample_rate as f32
     }
 
-    /// File name like "Test Loop - 71 BPM.wav" or "Test Loop - 92.5 BPM.wav".
+    /// File name like "Test Loop - 71 BPM.wav", "Test Loop - 92.5 BPM.wav"
+    /// or, pitched, "Test Loop - 71 BPM +3st.wav".
     pub fn file_name(&self) -> String {
         let bpm = format!("{:.2}", self.bpm);
         let bpm = bpm.trim_end_matches('0').trim_end_matches('.');
-        format!("{} - {bpm} BPM.wav", self.name)
+        format!("{} - {bpm} BPM{}.wav", self.name, self.pitch.suffix())
     }
 
     /// Writes a 24-bit stereo WAV into `dir` and returns its path.
@@ -496,6 +550,40 @@ mod tests {
     }
 
     #[test]
+    fn transpose_changes_pitch_not_length() {
+        // A 440 Hz sine, as a loop and as a song, shifted while stretched.
+        let sr = 48_000;
+        let sine = |secs: usize| -> Vec<f32> {
+            (0..secs * sr)
+                .flat_map(|i| {
+                    let s = (TAU * 440.0 * i as f32 / sr as f32).sin() * 0.5;
+                    [s, s]
+                })
+                .collect()
+        };
+        let hz = |r: &RenderedLoop| {
+            let left: Vec<f32> = r.samples.iter().step_by(2).copied().collect();
+            let mid = &left[sr..2 * sr];
+            mid.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count() as f32
+        };
+        for (secs, bpm) in [(2, 120.0), (5, 120.0)] {
+            let a = LoopAsset::new("sine", "sine", bpm, sr as u32, sine(secs));
+            for (pitch, want) in [
+                (Pitch { semitones: 12, cents: 0 }, 880.0),
+                (Pitch { semitones: -12, cents: 0 }, 220.0),
+                (Pitch { semitones: 3, cents: 0 }, 440.0 * 2f32.powf(3.0 / 12.0)),
+                (Pitch { semitones: 0, cents: 50 }, 440.0 * 2f32.powf(0.5 / 12.0)),
+            ] {
+                let a = LoopAsset::new("sine", "sine", bpm, sr as u32, a.samples.clone()).with_pitch(pitch);
+                let r = a.stretch_to(80.0);
+                assert_eq!(r.frames(), (secs * sr) * 3 / 2, "length follows tempo only");
+                assert!((hz(&r) - want).abs() < want * 0.015, "{pitch:?} ({secs}s): {} Hz, want {want}", hz(&r));
+                assert_eq!(r.pitch, pitch);
+            }
+        }
+    }
+
+    #[test]
     fn songs_stretch_start_to_end() {
         // 2.5 bars isn't a loop: stretched once, length scales with tempo.
         let base = LoopAsset::test_loop();
@@ -624,8 +712,13 @@ mod tests {
             samples: vec![],
             partial: false,
             key_hash: 0,
+            pitch: Pitch::NONE,
         };
         assert_eq!(mk(71.0).file_name(), "Test Loop - 71 BPM.wav");
         assert_eq!(mk(92.5).file_name(), "Test Loop - 92.5 BPM.wav");
+        let pitched = |semitones, cents| RenderedLoop { pitch: Pitch { semitones, cents }, ..mk(120.0) };
+        assert_eq!(pitched(3, 0).file_name(), "Test Loop - 120 BPM +3st.wav");
+        assert_eq!(pitched(-12, 25).file_name(), "Test Loop - 120 BPM -12st +25ct.wav");
+        assert_eq!(pitched(0, -50).file_name(), "Test Loop - 120 BPM -50ct.wav");
     }
 }

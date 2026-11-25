@@ -16,6 +16,7 @@ use crate::library::{BpmSource, BUILTIN_KEY, MAX_FILE_SECS};
 use crate::stems::STEM_NAMES;
 use crate::{
     dialog, drag, ChopLength, ChopSel, Selection, Shared, StemState, Task, TempoSampler, TempoSamplerParams,
+    IntParam, IntRange,
     TempoScale, ALL_STEMS, SONG_MIN_SECS,
 };
 
@@ -872,12 +873,12 @@ fn sidebar(cx: &mut Context) {
     VStack::new(cx, |cx| {
         // Brand
         centred(HStack::new(cx, |cx| {
-            centred(HStack::new(cx, |cx| {
-                Icon::new(cx, ICON_WAVE_SINE);
-            }))
+            // The takeout box (assets/logo.svg) on a white tile.
+            HStack::new(cx, |cx| {
+                crate::logo::Logo::new(cx).size(Stretch(1.0));
+            })
             .class("brand-mark")
-            .child_left(Stretch(1.0))
-            .child_right(Stretch(1.0));
+            .child_space(Pixels(2.0));
             Label::new(cx, crate::library::APP_NAME);
         }))
         .class("brand")
@@ -1114,6 +1115,121 @@ fn tempo_switch(cx: &mut Context) {
     .class("segmented");
 }
 
+/// Transpose and Detune, like the boxes in Ableton's clip view. They pitch
+/// everything (previews, pads, dragged files) without changing the tempo.
+fn pitch_controls(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        PitchBox::new(cx, |p| &p.transpose, "st", 4.0);
+        PitchBox::new(cx, |p| &p.detune, "ct", 2.0);
+    })
+    .class("segmented")
+    .class("pitch");
+}
+
+/// A value box for an integer parameter: drag up or down to change it
+/// (`px_per_step` pixels a step), scroll to step it, double-click to reset
+/// it to 0. One drag is one host gesture, so Live records it as one change.
+struct PitchBox {
+    params: Arc<TempoSamplerParams>,
+    param: fn(&TempoSamplerParams) -> &IntParam,
+    px_per_step: f32,
+    /// While dragging: the pointer's y and the value where the drag started.
+    drag: Option<(f32, i32)>,
+    /// Scroll not yet turned into steps (trackpads scroll in fractions).
+    scroll: f32,
+}
+
+impl PitchBox {
+    fn new<'a>(
+        cx: &'a mut Context,
+        param: fn(&TempoSamplerParams) -> &IntParam,
+        unit: &'static str,
+        px_per_step: f32,
+    ) -> Handle<'a, Self> {
+        let params = AppData::root.map(|d| d.params.clone()).get(cx);
+        let value = AppData::root.map(move |d| param(&d.params).value());
+        Self { params, param, px_per_step, drag: None, scroll: 0.0 }
+            .build(cx, move |cx| {
+                Label::new(cx, value.map(move |v| format!("{} {unit}", crate::signed(*v)))).hoverable(false);
+            })
+            .cursor(CursorIcon::NsResize)
+            .toggle_class("shifted", value.map(|v| *v != 0))
+    }
+
+    fn set(&self, cx: &mut EventContext, value: i32) {
+        use nih_plug_vizia::widgets::ParamEvent;
+        let param = (self.param)(&self.params);
+        let gesture = self.drag.is_none();
+        if gesture {
+            cx.emit(ParamEvent::BeginSetParameter(param).upcast());
+        }
+        cx.emit(ParamEvent::SetParameter(param, value).upcast());
+        if gesture {
+            cx.emit(ParamEvent::EndSetParameter(param).upcast());
+        }
+    }
+}
+
+impl View for PitchBox {
+    fn element(&self) -> Option<&'static str> {
+        Some("pitch-box")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        use nih_plug_vizia::widgets::ParamEvent;
+        let params = self.params.clone();
+        let param = (self.param)(&params);
+        let (min, max) = match param.range() {
+            IntRange::Linear { min, max } => (min, max),
+            _ => (i32::MIN, i32::MAX),
+        };
+        event.map(|window_event, meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                cx.emit(ParamEvent::BeginSetParameter(param).upcast());
+                self.drag = Some((cx.mouse().cursory, param.value()));
+                cx.capture();
+                meta.consume();
+            }
+            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
+                // Back to 0; a drag that carries on starts from there.
+                self.set(cx, 0);
+                if self.drag.is_some() {
+                    self.drag = Some((cx.mouse().cursory, 0));
+                }
+                meta.consume();
+            }
+            WindowEvent::MouseMove(_, y) => {
+                if let Some((origin, start)) = self.drag {
+                    let steps = ((origin - y) / (self.px_per_step * cx.scale_factor())).trunc() as i32;
+                    let value = (start + steps).clamp(min, max);
+                    if value != param.value() {
+                        self.set(cx, value);
+                    }
+                }
+            }
+            WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
+                self.drag = None;
+                cx.release();
+                cx.emit(ParamEvent::EndSetParameter(param).upcast());
+                meta.consume();
+            }
+            WindowEvent::MouseScroll(_, y) => {
+                self.scroll += y;
+                let steps = self.scroll.trunc();
+                if steps != 0.0 {
+                    self.scroll -= steps;
+                    let value = (param.value() + steps as i32).clamp(min, max);
+                    if value != param.value() {
+                        self.set(cx, value);
+                    }
+                }
+                meta.consume();
+            }
+            _ => {}
+        });
+    }
+}
+
 /// Tabler "star" outline (in vizia's bundled icon font, not in its list of names).
 const ICON_STAR: &str = "\u{eb2e}";
 
@@ -1247,6 +1363,7 @@ fn chops_card(cx: &mut Context, shared: Arc<Shared>, view: Arc<crate::SongView>)
         centred(HStack::new(cx, |cx| {
             Icon::new(cx, ICON_CUT).class("lead-icon");
             Label::new(cx, "Chops").width(Stretch(1.0));
+            pitch_controls(cx);
             tempo_switch(cx);
             HStack::new(cx, |cx| {
                 for bars in [2usize, 4, 1] {
@@ -1310,6 +1427,7 @@ fn loop_card(cx: &mut Context) {
             Icon::new(cx, ICON_WAVE_SINE).class("lead-icon");
             Label::new(cx, AppData::selected_is_loop.map(|l| if *l { "Loop" } else { "Sample" }))
                 .width(Stretch(1.0));
+            pitch_controls(cx);
             tempo_switch(cx);
         }))
         .class("card-title")

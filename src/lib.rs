@@ -14,11 +14,12 @@ mod drag;
 pub mod key;
 pub mod library;
 mod editor;
+mod logo;
 pub mod loops;
 pub mod stems;
 
 use library::Library;
-use loops::{LoopAsset, RenderedLoop};
+use loops::{LoopAsset, Pitch, RenderedLoop};
 
 /// Wait this long after the tempo stops changing before re-stretching, so
 /// dragging the tempo in Ableton doesn't queue up dozens of renders.
@@ -250,6 +251,9 @@ pub struct Shared {
     pub preview_gain: AtomicF32,
     /// The host's sample rate (0 until known); renders are converted to it.
     pub host_rate: std::sync::atomic::AtomicU32,
+    /// Transpose (semitones) and Detune (cents) applied to every render.
+    transpose: AtomicI32,
+    detune: AtomicI32,
     /// Chop length (bars) shown in the chop grid. Kept here so it survives
     /// closing the window.
     pub chop_length: AtomicUsize,
@@ -308,11 +312,12 @@ impl Shared {
         let view = self.song_view.lock().unwrap().clone().filter(|v| v.key == selection.key);
         let sig = match &view {
             Some(v) if tempo > 0.0 => format!(
-                "{}|{}|{length}|{tempo}|{}|{}",
+                "{}|{}|{length}|{tempo}|{}|{}|{:?}",
                 v.key,
                 v.bpm,
                 selection.stem_mask,
-                self.host_rate.load(Ordering::Relaxed)
+                self.host_rate.load(Ordering::Relaxed),
+                self.pitch()
             ),
             _ => "current".to_string(),
         };
@@ -373,8 +378,10 @@ impl Shared {
     /// Brings the plugin in line with its parameters, the way the same
     /// clicks in the GUI would. Does nothing for values already in effect,
     /// so the GUI (which sets both) and the host can't fight.
-    pub fn apply_params(self: &Arc<Self>, stem_mask: u8, chop_length: usize, tempo_scale: f32) {
-        let mut rerender = false;
+    pub fn apply_params(self: &Arc<Self>, values: ParamValues) {
+        let ParamValues { stem_mask, chop_length, tempo_scale, pitch } = values;
+        // Transpose / Detune: everything is re-rendered at the new pitch.
+        let mut rerender = self.set_pitch(pitch);
         // Stems (at least one stays on). Applied to the selection once its
         // stems are ready; until then the switches wait.
         if stem_mask != 0 && self.stem_switches.swap(stem_mask, Ordering::Relaxed) != stem_mask {
@@ -404,6 +411,19 @@ impl Shared {
         if rerender {
             self.render_now();
         }
+    }
+
+    /// The pitch shift applied to renders.
+    pub fn pitch(&self) -> Pitch {
+        Pitch { semitones: self.transpose.load(Ordering::Relaxed), cents: self.detune.load(Ordering::Relaxed) }
+    }
+
+    /// Sets the pitch shift; true if it changed.
+    fn set_pitch(&self, pitch: Pitch) -> bool {
+        let old = self.pitch();
+        self.transpose.store(pitch.semitones, Ordering::Relaxed);
+        self.detune.store(pitch.cents, Ordering::Relaxed);
+        old != pitch
     }
 
     /// The gain that plays `key` at the common preview loudness.
@@ -651,7 +671,7 @@ impl Shared {
     /// reusing the last one if unchanged.
     fn load(&self, selection: &Selection) -> Result<Arc<LoopAsset>, String> {
         if let Some((sel, asset)) = self.loaded.lock().unwrap().as_ref() {
-            if sel == selection {
+            if sel == selection && asset.pitch == self.pitch() {
                 return Ok(asset.clone());
             }
         }
@@ -689,7 +709,8 @@ impl Shared {
             bpm,
             src.sample_rate,
             samples,
-        ))
+        )
+        .with_pitch(self.pitch()))
     }
 
     /// Runs chop analysis for a song (not a short loop) if it hasn't been
@@ -909,7 +930,7 @@ impl Shared {
         }
         let wanted = selection.render_key();
         if let Some(r) = self.current() {
-            if r.key == wanted && (r.bpm - bpm).abs() < 1e-3 && !r.partial {
+            if r.key == wanted && (r.bpm - bpm).abs() < 1e-3 && !r.partial && r.pitch == self.pitch() {
                 return self.write_export(r);
             }
         }
@@ -1005,7 +1026,16 @@ const FIRST_PAD_NOTE: u8 = 36;
 pub enum Task {
     Render { id: u64, bpm: f32 },
     /// Parameters changed (automation, MIDI mapping or the GUI): apply them.
-    ApplyParams { stem_mask: u8, chop_length: usize, tempo_scale: f32 },
+    ApplyParams(ParamValues),
+}
+
+/// The parameters `Shared::apply_params` acts on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamValues {
+    pub stem_mask: u8,
+    pub chop_length: usize,
+    pub tempo_scale: f32,
+    pub pitch: Pitch,
 }
 
 pub struct TempoSampler {
@@ -1041,7 +1071,7 @@ pub struct TempoSampler {
     /// The Live set's saved state has been applied.
     restored: bool,
     /// Parameter values last handed to `apply_params`.
-    applied_params: (u8, usize, f32),
+    applied_params: ParamValues,
 }
 
 #[derive(Params)]
@@ -1077,6 +1107,17 @@ pub struct TempoSamplerParams {
     /// Play previews and pads at a matched loudness (exports unchanged).
     #[id = "match_loud"]
     pub match_loudness: BoolParam,
+    /// Pitch shift for everything (previews, pads, dragged files), like
+    /// Ableton's clip Transpose and Detune. Tempo is unaffected.
+    #[id = "transpose"]
+    pub transpose: IntParam,
+    #[id = "detune"]
+    pub detune: IntParam,
+}
+
+/// "+3", "-12", "0": how Ableton shows Transpose and Detune.
+pub fn signed(v: i32) -> String {
+    if v == 0 { "0".into() } else { format!("{v:+}") }
 }
 
 impl TempoSamplerParams {
@@ -1086,6 +1127,10 @@ impl TempoSamplerParams {
             .iter()
             .enumerate()
             .fold(0, |m, (i, p)| if p.value() { m | 1 << i } else { m })
+    }
+
+    pub fn pitch(&self) -> Pitch {
+        Pitch { semitones: self.transpose.value(), cents: self.detune.value() }
     }
 }
 
@@ -1194,6 +1239,8 @@ impl Default for TempoSampler {
             pad_garbage: Mutex::new(pad_garbage),
             pads_down: AtomicU64::new(0),
             host_rate: std::sync::atomic::AtomicU32::new(0),
+            transpose: AtomicI32::new(0),
+            detune: AtomicI32::new(0),
             preview_gain: AtomicF32::new(1.0),
             session: session.clone(),
             restore_chop: Mutex::new(None),
@@ -1229,6 +1276,12 @@ impl Default for TempoSampler {
                 chop_length: EnumParam::new("Chop length", ChopLength::Two),
                 tempo_scale: EnumParam::new("Tempo", TempoScale::One),
                 match_loudness: BoolParam::new("Match loudness", true),
+                transpose: IntParam::new("Transpose", 0, IntRange::Linear { min: -48, max: 48 })
+                    .with_unit(" st")
+                    .with_value_to_string(Arc::new(signed)),
+                detune: IntParam::new("Detune", 0, IntRange::Linear { min: -50, max: 50 })
+                    .with_unit(" ct")
+                    .with_value_to_string(Arc::new(signed)),
             }),
             shared: Arc::new(shared),
             from_render,
@@ -1249,15 +1302,20 @@ impl Default for TempoSampler {
             voices: std::array::from_fn(|_| None),
             last_voice: 0,
             restored: false,
-            applied_params: (ALL_STEMS, 2, 1.0),
+            applied_params: ParamValues { stem_mask: ALL_STEMS, chop_length: 2, tempo_scale: 1.0, pitch: Pitch::NONE },
         }
     }
 }
 
 impl TempoSampler {
-    fn param_values(&self) -> (u8, usize, f32) {
+    fn param_values(&self) -> ParamValues {
         let p = &self.params;
-        (p.stem_mask(), p.chop_length.value().bars(), p.tempo_scale.value().factor())
+        ParamValues {
+            stem_mask: p.stem_mask(),
+            chop_length: p.chop_length.value().bars(),
+            tempo_scale: p.tempo_scale.value().factor(),
+            pitch: p.pitch(),
+        }
     }
 
     /// A pad was hit: start its clip from the top at `velocity` (0..1).
@@ -1357,9 +1415,7 @@ impl Plugin for TempoSampler {
         let shared = self.shared.clone();
         Box::new(move |task| match task {
             Task::Render { id, bpm } => shared.render(id, bpm),
-            Task::ApplyParams { stem_mask, chop_length, tempo_scale } => {
-                shared.apply_params(stem_mask, chop_length, tempo_scale)
-            }
+            Task::ApplyParams(values) => shared.apply_params(values),
         })
     }
 
@@ -1393,8 +1449,13 @@ impl Plugin for TempoSampler {
             self.shared.restore_session();
         }
         // Parameter values as loaded are what's in effect (the session state
-        // saved with them agrees); only later changes need applying.
+        // saved with them agrees); only later changes need applying. The
+        // pitch lives only in its parameters: take it from them, and
+        // re-render if it differs from what was playing.
         self.applied_params = self.param_values();
+        if self.shared.set_pitch(self.applied_params.pitch) {
+            self.requested_bpm = 0.0;
+        }
         true
     }
 
@@ -1436,8 +1497,7 @@ impl Plugin for TempoSampler {
         let values = self.param_values();
         if values != self.applied_params {
             self.applied_params = values;
-            let (stem_mask, chop_length, tempo_scale) = values;
-            context.execute_background(Task::ApplyParams { stem_mask, chop_length, tempo_scale });
+            context.execute_background(Task::ApplyParams(values));
         }
 
         let t = context.transport();
@@ -1653,6 +1713,30 @@ mod tests {
             assert!(Instant::now() < deadline, "render {id} did not finish");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn transpose_param_rerenders_at_the_new_pitch() {
+        let plugin = TempoSampler::default();
+        let shared = plugin.shared.clone();
+        shared.transport.tempo.store(100.0, Ordering::Relaxed);
+        let mut values = plugin.param_values();
+        let id = shared.next_request();
+        shared.render(id, 100.0);
+        assert_eq!(shared.current().unwrap().pitch, Pitch::NONE);
+        let plain = shared.current().unwrap();
+
+        values.pitch = Pitch { semitones: 3, cents: -20 };
+        shared.apply_params(values);
+        let pitched = shared.current().unwrap();
+        assert_eq!(pitched.pitch, values.pitch);
+        assert_eq!(pitched.frames(), plain.frames(), "tempo unchanged");
+        assert!(pitched.samples != plain.samples);
+        assert!(pitched.file_name().ends_with("100 BPM +3st -20ct.wav"), "{}", pitched.file_name());
+
+        // Applying the same values again does nothing.
+        shared.apply_params(values);
+        assert!(Arc::ptr_eq(&pitched, &shared.current().unwrap()));
     }
 
     #[test]

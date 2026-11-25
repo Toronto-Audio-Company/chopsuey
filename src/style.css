@@ -87,9 +87,6 @@ icon {
   border-radius: 8px;
   background-image: linear-gradient(to bottom, #ffffff, #d9d9d9);
 }
-.brand-mark icon {
-  color: #0b0b0b;
-}
 
 .search {
   height: 32px;
@@ -386,6 +383,30 @@ button.icon-button icon {
   box-shadow: 0px 1px 3px #00000029;
 }
 .segmented button:checked label {
+  color: #303030;
+  font-weight: bold;
+}
+
+/* Transpose / Detune boxes, in a segmented track: drag up or down, scroll,
+   double-click for 0. Raised and bold while shifted, like a checked tab. */
+pitch-box {
+  width: 56px;
+  height: 24px;
+  border-radius: 12px;
+  child-space: 1s;
+}
+.pitch pitch-box label {
+  color: #616161;
+  font-weight: regular;
+}
+.pitch pitch-box:hover label {
+  color: #303030;
+}
+pitch-box.shifted {
+  background-color: #ffffff;
+  box-shadow: 0px 1px 3px #00000029;
+}
+.pitch pitch-box.shifted label {
   color: #303030;
   font-weight: bold;
 }

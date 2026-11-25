@@ -20,9 +20,11 @@ chopsuey is an instrument: put it on a MIDI track (it appears under Plug-Ins →
 
 **Saved with your set:** the selected sample, chop, bar length and stem switches come back when you reopen the set, pads included.
 
-**Automation and MIDI mapping:** the stem switches, chop length, tempo (½×/1×/2×), pad mode and Match loudness are plugin parameters: automate them or map them in Live (Configure, or MIDI Map mode).
+**Automation and MIDI mapping:** the stem switches, chop length, tempo (½×/1×/2×), Transpose, Detune, pad mode and Match loudness are plugin parameters: automate them or map them in Live (Configure, or MIDI Map mode).
 
 **Browsing:** each sample shows its tempo and key ("88 BPM · Am · 2:18"; the key from the file name if it's there, else detected). Search matches names, folders and keys (`am`, `f#m`), and a range like `90-100` filters by tempo; words combine (`90-100 am`). Star a sample with the ☆ next to its title and show only starred ones with **Favourites**. Previews play at matched loudness (turn off with the Match loudness parameter); dragged files are untouched.
+
+**Pitch:** the **st** and **ct** boxes in the card header are Transpose (±48 semitones) and Detune (±50 cents), like a clip's in Live: the tempo doesn't change. Drag up or down on a box, scroll over it, or double-click it to reset to 0. The shift applies to everything: previews, pads and dragged files (named with the shift, e.g. "… - 120 BPM +3st.wav").
 
 **Dragged WAVs** are 24-bit at Live's sample rate and carry their tempo (an `acid` chunk) and, for loops, loop points (`smpl`), like sample-pack loops.
 
@@ -32,6 +34,6 @@ The HTDemucs weights may be research-only (trained on MUSDB). Personal use only;
 
 ## Development
 
-UI: all colours, spacing and type are in `src/style.css` (light sheet on a dark frame; tokens, the 8px grid and type rules are listed at the top). To see the UI without Ableton, run the standalone app (`cargo run --release --bin standalone -- --backend dummy`) or capture it: `scripts/screenshot.sh out.png "<part of a sample name>" [seconds]`; `TEMPO_SAMPLER_DEMO_CHOP=<n>` and `TEMPO_SAMPLER_DEMO_STEMS=0011` preselect a chop tile and stem switches.
+UI: the logo is `assets/logo.svg` (drawn by the plugin; plain M/L/C/Z paths only). After editing it, `scripts/make_icon.sh` rebuilds the Finder icon (`assets/chopsuey.icns`, needs `brew install librsvg`), which the install script puts on the plugin and on `~/Music/chopsuey`. All colours, spacing and type are in `src/style.css` (light sheet on a dark frame; tokens, the 8px grid and type rules are listed at the top). To see the UI without Ableton, run the standalone app (`cargo run --release --bin standalone -- --backend dummy`) or capture it: `scripts/screenshot.sh out.png "<part of a sample name>" [seconds]`; `TEMPO_SAMPLER_DEMO_CHOP=<n>` and `TEMPO_SAMPLER_DEMO_STEMS=0011` preselect a chop tile and stem switches.
 
 Dev tools (read-only): `cargo run --release --example detect_report -- <folder>` compares detected tempos with tempos in file names; `cargo run --release --example chop_report -- <folder>` lists the chops found in each song; `cargo run --release --example split_stems -- models/htdemucs_fp16weights.onnx <song> <out-dir>` splits one file and reports timing; `cargo run --release --example probe_files -- <file>...` checks that files decode and shows their detected tempo. `cargo run --release --example key_bench -- <folder>` scores key-detection settings against keys written in file names. `cargo run --release --example load_bench [-- --cold]` times opening the library (on a copy of your settings); `--cold` drops the tempo cache. Set `TEMPO_SAMPLER_TIMING=1` to print scan and window timings from the plugin or standalone app.
