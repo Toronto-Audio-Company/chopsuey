@@ -1,0 +1,28 @@
+[package]
+name = "tempo_sampler"
+version = "0.1.0"
+edition = "2021"
+description = "Shows the host tempo and stretches a loop to match it"
+
+[workspace]
+members = ["xtask"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+atomic_float = "0.1"
+signalsmith-stretch = "0.1.3"
+hound = "3.5.1"
+rtrb = "0.4.1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
