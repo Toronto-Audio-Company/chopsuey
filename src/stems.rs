@@ -293,13 +293,26 @@ pub fn cache_dir_for(source: &Path) -> Option<std::path::PathBuf> {
     Some(cache_root().join(format!("{:016x}", h.finish())))
 }
 
-/// Loads cached stems, or `None` if they aren't all there.
+/// Loads cached stems, or `None` if they aren't all there. The four files
+/// are read and decoded in parallel.
 pub fn load_cached(dir: &Path) -> Option<Stems> {
-    let mut stems: Vec<Vec<f32>> = Vec::new();
+    let loaded: Vec<Option<(Vec<f32>, u32)>> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = STEM_NAMES
+            .iter()
+            .map(|name| {
+                let path = dir.join(format!("{name}.wav"));
+                scope.spawn(move || {
+                    let bytes = std::fs::read(path).ok()?;
+                    crate::loops::decode_wav_bytes(&bytes).ok()
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().ok().flatten()).collect()
+    });
+    let mut stems = Vec::with_capacity(4);
     let mut sample_rate = 0;
-    for name in STEM_NAMES {
-        let reader = hound::WavReader::open(dir.join(format!("{name}.wav"))).ok()?;
-        let (s, sr) = crate::loops::decode_wav(reader).ok()?;
+    for l in loaded {
+        let (s, sr) = l?;
         sample_rate = sr;
         stems.push(s);
     }
@@ -320,13 +333,25 @@ pub fn save_cached(dir: &Path, stems: &Stems) -> Result<(), String> {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    for (name, s) in STEM_NAMES.iter().zip(&stems.stems) {
-        let mut w = hound::WavWriter::create(tmp.join(format!("{name}.wav")), spec).map_err(|e| e.to_string())?;
-        for v in s {
-            w.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16).map_err(|e| e.to_string())?;
-        }
-        w.finalize().map_err(|e| e.to_string())?;
-    }
+    // Four files in parallel, each packed in one buffer and written in one
+    // go (same 16-bit values as writing sample by sample).
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = STEM_NAMES
+            .iter()
+            .zip(&stems.stems)
+            .map(|(name, s)| {
+                let path = tmp.join(format!("{name}.wav"));
+                scope.spawn(move || {
+                    let mut data = Vec::with_capacity(s.len() * 2);
+                    for v in s {
+                        data.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+                    }
+                    crate::loops::write_wav_pcm(&path, spec, &data).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        jobs.into_iter().try_for_each(|j| j.join().map_err(|_| "stem writer panicked".to_string())?)
+    })?;
     std::fs::write(tmp.join("used"), b"").map_err(|e| e.to_string())?;
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&tmp, dir).map_err(|e| e.to_string())?;
@@ -396,7 +421,7 @@ mod tests {
         };
         let a = crate::loops::LoopAsset::test_loop();
         // Two copies so the model sees more than one window.
-        let x: Vec<f32> = a.samples.iter().chain(&a.samples).copied().collect();
+        let x: Vec<f32> = a.samples.iter().chain(a.samples.iter()).copied().collect();
         let mut sep = Separator::load(&path, Engine { gpu: false, cpu_threads: 4 }).unwrap();
         let st = sep.separate(&x, a.sample_rate, |_| {}, || false).unwrap().unwrap();
         assert_eq!(st.sample_rate, 48_000);

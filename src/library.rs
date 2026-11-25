@@ -168,6 +168,10 @@ pub struct Library {
     pub version: AtomicU64,
     /// Bumped per scan; a running scan stops when it sees a newer one.
     scan_generation: AtomicU64,
+    /// Mirrors `state.scanning`, and files still waiting for tempo detection,
+    /// so the GUI can show progress every frame without locking the state.
+    pub busy: std::sync::atomic::AtomicBool,
+    pub detecting: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for Library {
@@ -181,6 +185,8 @@ impl Default for Library {
             }),
             version: AtomicU64::new(1),
             scan_generation: AtomicU64::new(0),
+            busy: std::sync::atomic::AtomicBool::new(false),
+            detecting: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -275,6 +281,8 @@ impl Library {
         let config = {
             let mut st = self.state.lock().unwrap();
             st.scanning = true;
+            self.busy.store(true, Ordering::Relaxed);
+            self.detecting.store(0, Ordering::Relaxed);
             st.config.clone()
         };
         self.bump();
@@ -327,7 +335,7 @@ impl Library {
             }
             entries.push(make_entry(&config, path, secs, stamp));
         }
-        entries[1..].sort_by_key(|e| e.name.to_lowercase());
+        entries[1..].sort_by_cached_key(|e| e.name.to_lowercase());
         // (key, path, length, bare tempo from the name if any)
         let pending: Vec<(String, PathBuf, f32, Option<f32>)> = entries
             .iter()
@@ -348,6 +356,7 @@ impl Library {
             }
             st.entries = entries;
             st.config.scan_cache = scan_cache;
+            self.detecting.store(pending.len(), Ordering::Relaxed);
         }
         self.bump();
         if timing {
@@ -387,6 +396,7 @@ impl Library {
                 st.config.detected.insert(key.clone(), Detected { size, modified, bpm, from_name, version });
             }
             drop(st);
+            self.detecting.fetch_sub(1, Ordering::Relaxed);
             let mut last = last_bump.lock().unwrap();
             if last.elapsed() > Duration::from_millis(250) {
                 self.bump();
@@ -400,6 +410,8 @@ impl Library {
             return;
         }
         st.scanning = false;
+        self.busy.store(false, Ordering::Relaxed);
+        self.detecting.store(0, Ordering::Relaxed);
         save_config(&st.config);
         drop(st);
         self.bump();
@@ -449,7 +461,7 @@ fn cached_entries(config: &Config) -> Vec<Entry> {
             entries.push(make_entry(config, PathBuf::from(key), c.secs, Some((c.size, c.modified))));
         }
     }
-    entries[1..].sort_by_key(|e| e.name.to_lowercase());
+    entries[1..].sort_by_cached_key(|e| e.name.to_lowercase());
     entries
 }
 
@@ -473,10 +485,10 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) ->
     out.into_iter().map(|(_, r)| r).collect()
 }
 
+/// Detects a file's tempo, decoding only the part detection looks at.
 fn detect_file(path: &Path) -> Option<f32> {
-    let (stereo, sr) = crate::audio_file::decode(path).ok()?;
-    let mono: Vec<f32> = stereo.chunks(2).map(|f| (f[0] + f[1]) * 0.5).collect();
-    bpm::detect_bpm(&mono, sr)
+    let (window, sr, secs) = crate::audio_file::decode_mono_window(path).ok()?;
+    bpm::detect_bpm_window(&window, sr, secs)
 }
 
 fn file_stamp(path: &Path) -> Option<(u64, u64)> {

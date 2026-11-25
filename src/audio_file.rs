@@ -51,8 +51,10 @@ pub fn probe(path: &Path) -> Result<(f32, u32), String> {
 /// channels beyond two are dropped). Returns (samples, sample rate).
 pub fn decode(path: &Path) -> Result<(Vec<f32>, u32), String> {
     if is_wav(path) {
-        let reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
-        return crate::loops::decode_wav(reader).map_err(|e| e.to_string());
+        // One read, then bulk conversion (several times faster than hound's
+        // per-sample reader, same values).
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        return crate::loops::decode_wav_bytes(&bytes).map_err(|e| e.to_string());
     }
     let (mut format, track_id) = open(path)?;
     let track = format.tracks().iter().find(|t| t.id == track_id).ok_or("no audio track")?;
@@ -90,6 +92,87 @@ pub fn decode(path: &Path) -> Result<(Vec<f32>, u32), String> {
         }
     }
     Ok((out, sample_rate))
+}
+
+/// Just the part of a file that tempo detection looks at
+/// ([`crate::bpm::analysis_window`]), as mono, plus the sample rate and the
+/// file's length in seconds. Same samples as decoding the whole file and
+/// cutting the window out of its mono mix, without decoding (or keeping)
+/// the rest when the format allows skipping.
+pub fn decode_mono_window(path: &Path) -> Result<(Vec<f32>, u32, f32), String> {
+    let mono_of = |stereo: &[f32]| -> Vec<f32> { stereo.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5).collect() };
+    if is_wav(path) {
+        let (stereo, sr) = decode(path)?;
+        let frames = stereo.len() / 2;
+        let (start, len) = crate::bpm::analysis_window(frames, sr);
+        return Ok((mono_of(&stereo[start * 2..(start + len) * 2]), sr, frames as f32 / sr as f32));
+    }
+    let (mut format, track_id) = open(path)?;
+    let track = format.tracks().iter().find(|t| t.id == track_id).ok_or("no audio track")?;
+    let params = audio_params(track)?.clone();
+    let sample_rate = params.sample_rate.ok_or("unknown sample rate")?;
+    let Some(total) = track.num_frames else {
+        // Length unknown up front: decode it all.
+        let (stereo, sr) = decode(path)?;
+        let frames = stereo.len() / 2;
+        let (start, len) = crate::bpm::analysis_window(frames, sr);
+        return Ok((mono_of(&stereo[start * 2..(start + len) * 2]), sr, frames as f32 / sr as f32));
+    };
+    let total = total as usize;
+    let (start, len) = crate::bpm::analysis_window(total, sample_rate);
+    let end = start + len;
+    // Timestamps count frames when the time base is 1/sample rate; then
+    // packets well before the window needn't be decoded (decoding resumes
+    // a second early so the decoder has settled by the window).
+    let frame_stamps = track
+        .time_base
+        .is_some_and(|tb| tb.numer.get() == 1 && tb.denom.get() == sample_rate);
+    let resume = start.saturating_sub(sample_rate as usize);
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default().gapless(true))
+        .map_err(|e| format!("unsupported audio: {e}"))?;
+
+    let mut out = Vec::with_capacity(len);
+    let mut frame = Vec::<f32>::new();
+    let mut pos = 0usize; // frame index of the next decoded frame
+    let mut skipped = false;
+    while pos < end {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(e) => return Err(format!("couldn't read audio: {e}")),
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        if frame_stamps {
+            let pts = packet.pts.get().max(0) as usize;
+            if pts + packet.dur.get() as usize <= resume {
+                skipped = true;
+                continue;
+            }
+            if skipped {
+                decoder.reset();
+                skipped = false;
+            }
+            pos = pts;
+        }
+        let buf = match decoder.decode(&packet) {
+            Ok(buf) => buf,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(e) => return Err(format!("couldn't decode audio: {e}")),
+        };
+        let channels = buf.num_planes().max(1);
+        buf.copy_to_vec_interleaved(&mut frame);
+        for f in frame.chunks_exact(channels) {
+            if (start..end).contains(&pos) {
+                let (l, r) = (f[0], if channels > 1 { f[1] } else { f[0] });
+                out.push((l + r) * 0.5);
+            }
+            pos += 1;
+        }
+    }
+    Ok((out, sample_rate, total as f32 / sample_rate as f32))
 }
 
 fn open(path: &Path) -> Result<(Box<dyn FormatReader>, u32), String> {
@@ -170,7 +253,7 @@ mod tests {
         let (samples, sr) = decode(&path).unwrap();
         assert_eq!(sr, 48_000);
         assert_eq!(samples.len(), a.samples.len());
-        let err = samples.iter().zip(&a.samples).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let err = samples.iter().zip(a.samples.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         assert!(err < 1e-3, "max error {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3,8 +3,9 @@
 //! Nothing in here is realtime-safe (it allocates and does FFTs), so it only
 //! ever runs on the background thread or in the GUI, never in `process()`.
 
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A loop or song as stored on disk, at its original tempo. Always stereo.
 pub struct LoopAsset {
@@ -18,8 +19,9 @@ pub struct LoopAsset {
     /// Whole bars that should repeat seamlessly; otherwise a song or chop.
     pub is_loop: bool,
     pub sample_rate: u32,
-    /// Interleaved stereo samples (L, R, L, R, ...).
-    pub samples: Vec<f32>,
+    /// Interleaved stereo samples (L, R, L, R, ...). Shared with the decoded
+    /// file when this is a whole file, so selecting a song doesn't copy it.
+    pub samples: Arc<Vec<f32>>,
 }
 
 /// A loop stretched to a particular project tempo. Same sample rate and beat
@@ -36,6 +38,9 @@ pub struct RenderedLoop {
     pub sample_rate: u32,
     /// Interleaved stereo samples.
     pub samples: Vec<f32>,
+    /// Only the start of a song, published so it can play while the rest is
+    /// still stretching. Never exported.
+    pub partial: bool,
 }
 
 impl LoopAsset {
@@ -57,7 +62,8 @@ impl LoopAsset {
         Ok(Self::new(key, name, bpm, sample_rate, samples))
     }
 
-    pub fn new(key: &str, name: &str, bpm: f32, sample_rate: u32, samples: Vec<f32>) -> Self {
+    pub fn new(key: &str, name: &str, bpm: f32, sample_rate: u32, samples: impl Into<Arc<Vec<f32>>>) -> Self {
+        let samples = samples.into();
         let secs = (samples.len() / 2) as f32 / sample_rate as f32;
         let is_loop = crate::bpm::is_loop(secs, bpm);
         let beats = secs * bpm / 60.0;
@@ -72,6 +78,72 @@ impl LoopAsset {
             samples,
         }
     }
+}
+
+/// Decodes a WAV held in memory (read in one go, which is much faster than
+/// hound's per-sample reader): the header via hound, then the sample bytes
+/// converted in bulk with the same arithmetic as `decode_wav`. Falls back
+/// to `decode_wav` for packings it doesn't handle.
+pub fn decode_wav_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32), hound::Error> {
+    let reader = hound::WavReader::new(Cursor::new(bytes))?;
+    let spec = reader.spec();
+    let count = reader.len() as usize;
+    let start = reader.into_inner().position() as usize;
+    // The data chunk's size is the 4 bytes just before its samples.
+    let data_len = (start >= 4).then(|| u32::from_le_bytes(bytes[start - 4..start].try_into().unwrap()) as usize);
+    let width = match data_len {
+        Some(len) if count > 0 => len / count,
+        _ => 0,
+    };
+    let data = &bytes[start.min(bytes.len())..(start + count * width).min(bytes.len())];
+    let raw: Vec<f32> = match (spec.sample_format, width, spec.bits_per_sample) {
+        (hound::SampleFormat::Float, 4, 32) => {
+            data.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+        }
+        (hound::SampleFormat::Int, w, bits @ (8 | 16 | 24 | 32)) if matches!((w, bits), (1, 8) | (2, 16) | (3, 24) | (4, 24) | (4, 32)) => {
+            let scale = 1.0 / (1i64 << (bits - 1)) as f32;
+            match (w, bits) {
+                (1, _) => data.iter().map(|&x| ((x as i16 - 128) as i8) as i32 as f32 * scale).collect(),
+                (2, _) => data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as i32 as f32 * scale).collect(),
+                (3, _) => data
+                    .chunks_exact(3)
+                    .map(|b| {
+                        let x = u32::from_le_bytes([b[0], b[1], b[2], 0]);
+                        let v = if x & (1 << 23) == 0 { x as i32 } else { (x | 0xff00_0000) as i32 };
+                        v as f32 * scale
+                    })
+                    .collect(),
+                (4, 24) => data
+                    .chunks_exact(4)
+                    .map(|b| {
+                        let x = u32::from_le_bytes(b.try_into().unwrap());
+                        let v = if x & (1 << 23) == 0 { (x & 0x00ff_ffff) as i32 } else { (x | 0xff00_0000) as i32 };
+                        v as f32 * scale
+                    })
+                    .collect(),
+                _ => data.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap()) as f32 * scale).collect(),
+            }
+        }
+        _ => return decode_wav(hound::WavReader::new(Cursor::new(bytes))?),
+    };
+    if raw.len() != count {
+        return decode_wav(hound::WavReader::new(Cursor::new(bytes))?); // truncated file: let hound decide
+    }
+    Ok((to_stereo(raw, spec.channels), spec.sample_rate))
+}
+
+/// Interleaved frames of `channels` channels to interleaved stereo (mono
+/// duplicated, channels beyond two dropped).
+fn to_stereo(raw: Vec<f32>, channels: u16) -> Vec<f32> {
+    let ch = (channels as usize).max(1);
+    if ch == 2 {
+        return raw;
+    }
+    let mut samples = Vec::with_capacity(raw.len() / ch * 2);
+    for f in raw.chunks_exact(ch) {
+        samples.extend_from_slice(&[f[0], if ch > 1 { f[1] } else { f[0] }]);
+    }
+    samples
 }
 
 /// Decodes any PCM/float WAV to interleaved stereo f32 (mono is duplicated,
@@ -90,38 +162,138 @@ pub fn decode_wav<R: std::io::Read>(
                 .collect::<Result<_, _>>()?
         }
     };
-    let ch = (spec.channels as usize).max(1);
-    let samples = raw
-        .chunks_exact(ch)
-        .flat_map(|f| [f[0], if ch > 1 { f[1] } else { f[0] }])
-        .collect();
-    Ok((samples, spec.sample_rate))
+    Ok((to_stereo(raw, spec.channels), spec.sample_rate))
 }
 
 impl LoopAsset {
 
     /// Stretches to `target_bpm` without changing pitch.
     ///
-    /// Loops come out seamless: we stretch three back-to-back copies and keep
-    /// the middle one, so the stretcher's start-up and tail artifacts land in
-    /// the discarded copies and the seam is processed like any other point.
-    /// Songs and chops are stretched once, start to end.
+    /// Loops come out seamless: the loop is stretched with a short
+    /// wrap-around pad on each side (its own end before it, its own start
+    /// after it), and the pads are cut off. The stretcher's start-up and tail
+    /// land in the pads, and the seam is processed like any other point.
+    /// Songs are stretched once, start to end.
     pub fn stretch_to(&self, target_bpm: f32) -> RenderedLoop {
         let in_frames = self.frames();
-        let out_frames = (in_frames as f64 * self.bpm as f64 / target_bpm as f64).round() as usize;
+        let ratio = self.bpm as f64 / target_bpm as f64;
+        let out_frames = (in_frames as f64 * ratio).round() as usize;
         let mut stretch = signalsmith_stretch::Stretch::preset_default(2, self.sample_rate);
 
         let samples = if self.is_loop {
-            let tiled: Vec<f32> = self.samples.repeat(3);
-            let mut out = vec![0.0f32; out_frames * 3 * 2];
-            stretch.exact(&tiled, &mut out);
-            out[out_frames * 2..out_frames * 4].to_vec()
-        } else {
-            let mut out = vec![0.0f32; out_frames * 2];
-            stretch.exact(&self.samples, &mut out);
+            // Half a second of context each side: several times the
+            // stretcher's ~0.12 s window. A loop shorter than that wraps once.
+            let pad = (self.sample_rate as usize / 2).min(in_frames);
+            let mut padded = Vec::with_capacity((in_frames + 2 * pad) * 2);
+            padded.extend_from_slice(&self.samples[(in_frames - pad) * 2..]);
+            padded.extend_from_slice(&self.samples);
+            padded.extend_from_slice(&self.samples[..pad * 2]);
+            let pad_out = (pad as f64 * ratio).round() as usize;
+            let mut out = vec![0.0f32; (out_frames + 2 * pad_out) * 2];
+            stretch.exact(&padded, &mut out);
+            out.copy_within(pad_out * 2..(pad_out + out_frames) * 2, 0);
+            out.truncate(out_frames * 2);
             out
+        } else {
+            self.stretch_stream(out_frames, None, &|| false).expect("not cancelled")
         };
+        self.rendered(target_bpm, samples, false)
+    }
 
+    /// `stretch_to` for songs, giving up (None) as soon as `cancelled()`
+    /// says the result is no longer wanted.
+    pub fn stretch_to_cancellable(&self, target_bpm: f32, cancelled: &dyn Fn() -> bool) -> Option<RenderedLoop> {
+        if self.is_loop {
+            return Some(self.stretch_to(target_bpm));
+        }
+        let out_frames = (self.frames() as f64 * self.bpm as f64 / target_bpm as f64).round() as usize;
+        let samples = self.stretch_stream(out_frames, None, cancelled)?;
+        Some(self.rendered(target_bpm, samples, false))
+    }
+
+    /// The first `in_frames` of a song stretched to `target_bpm`, to start
+    /// playing while the whole song stretches. Stretches a little more than
+    /// asked and keeps the start, so it matches the full render (the
+    /// stretcher only looks a short way ahead).
+    pub fn stretch_start(&self, target_bpm: f32, in_frames: usize) -> RenderedLoop {
+        let ratio = self.bpm as f64 / target_bpm as f64;
+        let out_frames = (self.frames() as f64 * ratio).round() as usize;
+        let keep = ((in_frames as f64 * ratio).round() as usize).min(out_frames);
+        let samples = self.stretch_stream(out_frames, Some(keep), &|| false).expect("not cancelled");
+        self.rendered(target_bpm, samples, true)
+    }
+
+    /// What `Stretch::exact` does (prime with the first input, process it
+    /// all, undo the output latency, flush the tail), but processing in
+    /// fixed-size pieces whose input positions depend only on the rate.
+    /// So the first pieces are the same whatever happens later: `keep`
+    /// stops early and returns just the first `keep` frames, bit-identical
+    /// to the start of the full render, and `cancelled` is checked between
+    /// pieces.
+    fn stretch_stream(&self, out_frames: usize, keep: Option<usize>, cancelled: &dyn Fn() -> bool) -> Option<Vec<f32>> {
+        const PIECE: usize = 16_384;
+        let in_frames = self.frames();
+        let mut st = signalsmith_stretch::Stretch::preset_default(2, self.sample_rate);
+        let (lat_in, lat_out) = (st.input_latency(), st.output_latency());
+        if out_frames < lat_out * 2 || in_frames <= lat_in {
+            // Too short to split up (never a song): one go.
+            let mut out = vec![0.0f32; out_frames * 2];
+            st.exact(&self.samples[..], &mut out);
+            out.truncate(keep.unwrap_or(out_frames) * 2);
+            return Some(out);
+        }
+        let rate = in_frames as f64 / out_frames as f64;
+        st.seek(&self.samples[..lat_in * 2], rate);
+
+        // The input after the priming part, then silence, `in_frames` long.
+        let real = in_frames - lat_in;
+        let mut pad = Vec::new();
+
+        // Output frames to produce before undoing the latency.
+        let need = match keep {
+            Some(k) => (lat_out + k).min(out_frames),
+            None => out_frames,
+        };
+        let produced = (need.div_ceil(PIECE) * PIECE).min(out_frames);
+        let mut out = vec![0.0f32; produced * 2];
+        let (mut o, mut i) = (0, 0);
+        while o < produced {
+            if cancelled() {
+                return None;
+            }
+            let o1 = (o + PIECE).min(out_frames);
+            let i1 = ((o1 as f64 * rate).round() as usize).min(in_frames);
+            if i1 <= real {
+                st.process(&self.samples[(lat_in + i) * 2..(lat_in + i1) * 2], &mut out[o * 2..o1 * 2]);
+            } else {
+                pad.clear();
+                pad.extend_from_slice(&self.samples[(lat_in + i.min(real)) * 2..]);
+                pad.resize((i1 - i) * 2, 0.0);
+                st.process(&pad, &mut out[o * 2..o1 * 2]);
+            }
+            (o, i) = (o1, i1);
+        }
+
+        // Fold the first output back onto itself, then shift by the latency.
+        for k in 0..(out_frames - lat_out).min(lat_out) {
+            for c in 0..2 {
+                out[(k + lat_out) * 2 + c] -= out[(lat_out - 1 - k) * 2 + c];
+            }
+        }
+        out.copy_within(lat_out * 2.., 0);
+        match keep {
+            Some(k) => {
+                out.truncate(k * 2);
+            }
+            None => {
+                // The last `lat_out` frames come from flushing.
+                st.flush(&mut out[(out_frames - lat_out) * 2..]);
+            }
+        }
+        Some(out)
+    }
+
+    fn rendered(&self, target_bpm: f32, samples: Vec<f32>, partial: bool) -> RenderedLoop {
         RenderedLoop {
             key: self.key.clone(),
             name: self.name.clone(),
@@ -131,6 +303,7 @@ impl LoopAsset {
             span: None,
             sample_rate: self.sample_rate,
             samples,
+            partial,
         }
     }
 }
@@ -161,14 +334,40 @@ impl RenderedLoop {
             bits_per_sample: 24,
             sample_format: hound::SampleFormat::Int,
         };
-        let mut w = hound::WavWriter::create(&path, spec)?;
+        // Samples packed to 24-bit in one buffer and written in one go
+        // (same values hound's `write_sample` would write, ~10× faster).
         let max = ((1 << 23) - 1) as f32;
+        let mut data = Vec::with_capacity(self.samples.len() * 3);
         for s in &self.samples {
-            w.write_sample((s.clamp(-1.0, 1.0) * max) as i32)?;
+            let v = (s.clamp(-1.0, 1.0) * max) as i32;
+            data.extend_from_slice(&v.to_le_bytes()[..3]);
         }
-        w.finalize()?;
+        write_wav_pcm(&path, spec, &data)?;
         Ok(path)
     }
+}
+
+/// Writes a plain integer PCM WAV (`spec.bits_per_sample`, packed): RIFF
+/// header, `fmt ` chunk, then `data` (already little-endian samples).
+pub fn write_wav_pcm(path: &Path, spec: hound::WavSpec, data: &[u8]) -> std::io::Result<()> {
+    let ch = spec.channels as u32;
+    let bytes = spec.bits_per_sample as u32 / 8;
+    let block = ch * bytes;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data.len() as u32).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    f.write_all(&16u32.to_le_bytes())?;
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&(ch as u16).to_le_bytes())?;
+    f.write_all(&spec.sample_rate.to_le_bytes())?;
+    f.write_all(&(spec.sample_rate * block).to_le_bytes())?;
+    f.write_all(&(block as u16).to_le_bytes())?;
+    f.write_all(&spec.bits_per_sample.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&(data.len() as u32).to_le_bytes())?;
+    f.write_all(data)?;
+    f.flush()
 }
 
 /// Where exported WAVs go. Persistent (not a cache folder), because Ableton
@@ -235,7 +434,7 @@ mod tests {
     fn songs_stretch_start_to_end() {
         // 2.5 bars isn't a loop: stretched once, length scales with tempo.
         let base = LoopAsset::test_loop();
-        let five_secs: Vec<f32> = base.samples.iter().chain(&base.samples).take(5 * 48_000 * 2).copied().collect();
+        let five_secs: Vec<f32> = base.samples.iter().chain(base.samples.iter()).take(5 * 48_000 * 2).copied().collect();
         let a = LoopAsset::new("chop", "chop", 120.0, 48_000, five_secs);
         assert!(!a.is_loop);
         assert_eq!(a.beats, 10.0);
@@ -263,6 +462,80 @@ mod tests {
         }
     }
 
+    /// A song's quick start render is bit-identical to the start of its full
+    /// render, so swapping one for the other mid-playback is seamless.
+    #[test]
+    fn start_render_matches_full_render() {
+        let base = LoopAsset::test_loop();
+        let long: Vec<f32> = (0..10).flat_map(|_| base.samples.iter().copied()).collect(); // 40 s
+        let song = LoopAsset::new("k", "song", 97.0, base.sample_rate, long);
+        assert!(!song.is_loop || song.frames() > 0);
+        let full = song.stretch_to(120.0);
+        let start = song.stretch_start(120.0, 10 * 48_000);
+        assert!(start.partial && !full.partial);
+        let n = start.samples.len();
+        assert_eq!(n, ((10.0 * 48_000.0 * 97.0 / 120.0) as f64).round() as usize * 2);
+        let first = start.samples.iter().zip(&full.samples[..n]).position(|(a, b)| a != b);
+        assert_eq!(first, None, "start render differs from frame {:?} of {}", first.map(|i| i / 2), n / 2);
+
+        // And the piecewise full render sounds like a one-go `exact` render.
+        let mut one_go = vec![0.0f32; full.samples.len()];
+        signalsmith_stretch::Stretch::preset_default(2, 48_000).exact(&song.samples[..], &mut one_go);
+        let energy = |x: &[f32]| x.iter().map(|v| v * v).sum::<f32>();
+        let (e1, e2) = (energy(&full.samples), energy(&one_go));
+        assert!((e1 / e2 - 1.0).abs() < 0.02, "energy {e1} vs {e2}");
+    }
+
+    /// Exports read back as the same 24-bit values hound would have written.
+    #[test]
+    fn wav_export_reads_back() {
+        let r = LoopAsset::test_loop().stretch_to(100.0);
+        let dir = std::env::temp_dir().join(format!("tempo-sampler-wav-{}", std::process::id()));
+        let path = r.write_wav(&dir).unwrap();
+        let reader = hound::WavReader::open(&path).unwrap();
+        assert_eq!(reader.spec().bits_per_sample, 24);
+        assert_eq!(reader.spec().sample_rate, r.sample_rate);
+        let max = ((1 << 23) - 1) as f32;
+        let read: Vec<i32> = reader.into_samples::<i32>().map(|s| s.unwrap()).collect();
+        assert_eq!(read.len(), r.samples.len());
+        assert!(read.iter().zip(&r.samples).all(|(&v, s)| v == (s.clamp(-1.0, 1.0) * max) as i32));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The in-memory WAV decoder gives exactly what hound's reader gives.
+    #[test]
+    fn fast_wav_decode_matches_hound() {
+        let a = LoopAsset::test_loop();
+        let cases = [
+            (1u16, 16u16, hound::SampleFormat::Int),
+            (2, 16, hound::SampleFormat::Int),
+            (2, 24, hound::SampleFormat::Int),
+            (2, 32, hound::SampleFormat::Int),
+            (2, 32, hound::SampleFormat::Float),
+            (2, 8, hound::SampleFormat::Int),
+        ];
+        for (channels, bits, format) in cases {
+            let spec = hound::WavSpec { channels, sample_rate: 44_100, bits_per_sample: bits, sample_format: format };
+            let mut bytes = Cursor::new(Vec::new());
+            let mut w = hound::WavWriter::new(&mut bytes, spec).unwrap();
+            let max = ((1i64 << (bits - 1)) - 1) as f32;
+            for f in a.samples.chunks(2).take(20_000) {
+                for c in 0..channels as usize {
+                    match format {
+                        hound::SampleFormat::Float => w.write_sample(f[c]).unwrap(),
+                        hound::SampleFormat::Int => w.write_sample((f[c] * max) as i32).unwrap(),
+                    }
+                }
+            }
+            w.finalize().unwrap();
+            let bytes = bytes.into_inner();
+            let slow = decode_wav(hound::WavReader::new(Cursor::new(&bytes[..])).unwrap()).unwrap();
+            let fast = decode_wav_bytes(&bytes).unwrap();
+            assert_eq!(fast.1, slow.1);
+            assert!(fast.0 == slow.0, "{channels} ch {bits}-bit {format:?} differs");
+        }
+    }
+
     #[test]
     fn file_names() {
         let mk = |bpm| RenderedLoop {
@@ -274,6 +547,7 @@ mod tests {
             span: None,
             sample_rate: 48_000,
             samples: vec![],
+            partial: false,
         };
         assert_eq!(mk(71.0).file_name(), "Test Loop - 71 BPM.wav");
         assert_eq!(mk(92.5).file_name(), "Test Loop - 92.5 BPM.wav");

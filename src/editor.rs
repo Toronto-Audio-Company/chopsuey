@@ -521,10 +521,9 @@ fn render_status(s: &Shared) -> Option<String> {
     (!ready).then(|| "Stretching…".to_string())
 }
 
-/// Shown under the list while scanning.
+/// Shown under the list while scanning. Reads atomics only (runs every frame).
 fn library_summary(s: &Shared) -> String {
-    let st = s.library.state.lock().unwrap();
-    match st.entries.iter().filter(|e| e.source == BpmSource::Pending).count() {
+    match s.library.detecting.load(Ordering::Relaxed) {
         0 => "Scanning…".into(),
         n => format!("Detecting tempo · {n} left"),
     }
@@ -780,7 +779,7 @@ fn sidebar(cx: &mut Context) {
             .child_left(Pixels(ICON_COLUMN))
             .toggle_class(
                 "hidden",
-                AppData::shared.map(|s| !s.library.state.lock().unwrap().scanning),
+                AppData::shared.map(|s| !s.library.busy.load(Ordering::Relaxed)),
             );
 
         Element::new(cx).height(Pixels(1.0)).background_color(Color::rgb(0x22, 0x22, 0x22));
@@ -987,16 +986,17 @@ fn stems_card(cx: &mut Context) {
         .col_between(Pixels(8.0));
 
         HStack::new(cx, |cx| {
+            // One lookup shared by the four buttons (lenses run every frame).
+            let ready = AppData::shared.map(|s| {
+                let sel = s.selection.lock().unwrap();
+                s.stems_for(&sel.key).is_some()
+            });
             for (i, name) in STEM_NAMES.iter().enumerate() {
                 let label = {
                     let mut c = name.chars();
                     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
                 };
                 let on = AppData::shared.map(move |s| s.stem_switches.load(Ordering::Relaxed) & (1 << i) != 0);
-                let ready = AppData::shared.map(|s| {
-                    let key = s.selection.lock().unwrap().key.clone();
-                    s.stems_for(&key).is_some()
-                });
                 // On/off button: indicator light and name. A plain row
                 // (not a vizia Button) so the name can fill the middle.
                 centred(HStack::new(cx, move |cx| {
@@ -1182,24 +1182,38 @@ fn wave_frame(cx: &mut Context, content: impl FnOnce(&mut Context)) {
     VStack::new(cx, content).class("wave-frame").height(Stretch(1.0)).hoverable(false);
 }
 
-/// One min/max column per pixel, scaled to the overview's peak.
+/// The waveform as one filled outline (top edge left to right, bottom edge
+/// back), scaled to the overview's peak: one path per tile instead of a
+/// rectangle per pixel column. At most one point per overview entry.
 fn draw_overview(canvas: &mut Canvas, b: BoundingBox, overview: &[(f32, f32)], colour: vg::Color) {
     let peak = overview.iter().fold(0.0f32, |m, &(lo, hi)| m.max(-lo).max(hi)).max(1e-4);
     let mid = b.y + b.h / 2.0;
     let half = b.h / 2.0 - 1.0;
-    let columns = b.w.max(1.0) as usize;
+    let columns = (b.w.max(1.0) as usize).min(overview.len()).max(1);
+    let step = b.w / columns as f32;
+    let edges: Vec<(f32, f32, f32)> = (0..columns)
+        .map(|col| {
+            let i0 = col * overview.len() / columns;
+            let i1 = ((col + 1) * overview.len() / columns).max(i0 + 1).min(overview.len());
+            let (lo, hi) = overview[i0..i1].iter().fold((0.0f32, 0.0f32), |(lo, hi), &(a, z)| (lo.min(a), hi.max(z)));
+            // At least a hairline where it's silent.
+            let (top, bottom) = (mid - hi / peak * half, mid - lo / peak * half);
+            let pad = ((1.0 - (bottom - top)) / 2.0).max(0.0);
+            (b.x + (col as f32 + 0.5) * step, top - pad, bottom + pad)
+        })
+        .collect();
     let mut path = vg::Path::new();
-    for col in 0..columns {
-        let i0 = col * overview.len() / columns;
-        let i1 = ((col + 1) * overview.len() / columns).max(i0 + 1).min(overview.len());
-        if i0 >= overview.len() {
-            break;
-        }
-        let (lo, hi) = overview[i0..i1].iter().fold((0.0f32, 0.0f32), |(lo, hi), &(a, z)| (lo.min(a), hi.max(z)));
-        let top = mid - hi / peak * half;
-        let bottom = mid - lo / peak * half;
-        path.rect(b.x + col as f32, top, 1.0, (bottom - top).max(1.0));
+    path.move_to(b.x, edges[0].1);
+    for &(x, top, _) in &edges {
+        path.line_to(x, top);
     }
+    path.line_to(b.x + b.w, edges[columns - 1].1);
+    path.line_to(b.x + b.w, edges[columns - 1].2);
+    for &(x, _, bottom) in edges.iter().rev() {
+        path.line_to(x, bottom);
+    }
+    path.line_to(b.x, edges[0].2);
+    path.close();
     canvas.fill_path(&path, &vg::Paint::color(colour));
 }
 
@@ -1233,15 +1247,22 @@ impl ChopTile {
                 wave_frame(cx, |cx| {
                     ChopWave::new(cx, shared, index)
                         .hoverable(false)
+                        // Redraw when this tile's playhead moves (only the
+                        // selected tile shows one, so the rest don't follow
+                        // the playhead), when it's (de)selected, or when the
+                        // stem switches change its waveform. Atomics only.
                         .bind(
-                            AppData::shared.map(|s| {
-                                let playhead = (s.playhead.load(Ordering::Relaxed) * 4000.0) as i64;
-                                let mask = s.selection.lock().unwrap().stem_mask;
-                                (playhead, mask)
+                            AppData::root.map(move |d| {
+                                let selected = d.selected_chop == index as i64;
+                                let playhead = if selected {
+                                    (d.shared.playhead.load(Ordering::Relaxed) * 4000.0) as i64
+                                } else {
+                                    -1
+                                };
+                                (selected, playhead, d.shared.stem_switches.load(Ordering::Relaxed))
                             }),
                             |mut h, _| h.needs_redraw(),
-                        )
-                        .bind(AppData::selected_chop, |mut h, _| h.needs_redraw());
+                        );
                 });
                 Label::new(cx, &label).text_wrap(false).height(Pixels(16.0)).hoverable(false);
             })
@@ -1284,7 +1305,10 @@ impl View for ChopWave {
         }
         let Some(view) = self.shared.song_view.lock().unwrap().clone() else { return };
         // With some stems off, show the waveform of what's actually playing.
-        let mask = self.shared.selection.lock().unwrap().stem_mask;
+        let (mask, selected) = {
+            let sel = self.shared.selection.lock().unwrap();
+            (sel.stem_mask, sel.chop.as_ref().map(|c| c.index))
+        };
         let mixed = if mask != ALL_STEMS { self.shared.mixed_chop_overviews(mask) } else { None };
         let overview = match &mixed {
             Some(m) => m.get(self.index),
@@ -1298,7 +1322,6 @@ impl View for ChopWave {
         }
 
         // Selected chop in the accent colour, others in a quiet grey.
-        let selected = self.shared.selection.lock().unwrap().chop.as_ref().map(|c| c.index);
         let colour = if selected == Some(self.index) {
             vg::Color::rgb(0x1a, 0x1a, 0x1a)
         } else {

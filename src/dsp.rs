@@ -13,8 +13,10 @@ pub fn fft_size(sample_rate: u32) -> usize {
 }
 
 /// Runs a Hann-windowed STFT over `mono` (frame `f` starts at `f * hop`) and
-/// calls `per_frame(f, log_mags)` with compressed magnitudes
-/// `ln(1 + 100·|X|)` for bins 0..=n_fft/2. Bin `k` is `k · sr / n_fft` Hz.
+/// calls `per_frame(f, log_mags)`, in frame order, with compressed
+/// magnitudes `ln(1 + 100·|X|)` for bins 0..=n_fft/2. Bin `k` is
+/// `k · sr / n_fft` Hz. Long inputs are split across cores (frames are
+/// independent); results are identical either way.
 pub fn stft_log_mags(mono: &[f32], sample_rate: u32, hop: usize, mut per_frame: impl FnMut(usize, &[f32])) {
     let n_fft = fft_size(sample_rate);
     let window: Vec<f32> = (0..n_fft)
@@ -22,21 +24,61 @@ pub fn stft_log_mags(mono: &[f32], sample_rate: u32, hop: usize, mut per_frame: 
         .collect();
     let fft = FftPlanner::<f32>::new().plan_fft_forward(n_fft);
     let bins = n_fft / 2 + 1;
-    let mut buf = vec![Complex::new(0.0f32, 0.0); n_fft];
-    let mut mag = vec![0.0f32; bins];
-    for f in 0..mono.len() / hop {
-        let start = f * hop;
-        for (i, b) in buf.iter_mut().enumerate() {
-            let x = mono.get(start + i).copied().unwrap_or(0.0);
-            *b = Complex::new(x * window[i], 0.0);
+    let frames = mono.len() / hop;
+
+    // Log magnitudes of frames `range`, one after another, into `out`.
+    let compute = |range: std::ops::Range<usize>, out: &mut dyn FnMut(usize, &[f32])| {
+        let mut buf = vec![Complex::new(0.0f32, 0.0); n_fft];
+        let mut scratch = vec![Complex::new(0.0f32, 0.0); fft.get_inplace_scratch_len()];
+        let mut mag = vec![0.0f32; bins];
+        for f in range {
+            let start = f * hop;
+            let have = mono.len().saturating_sub(start).min(n_fft);
+            for ((b, &x), &w) in buf.iter_mut().zip(&mono[start..start + have]).zip(&window) {
+                *b = Complex::new(x * w, 0.0);
+            }
+            for b in &mut buf[have..] {
+                *b = Complex::new(0.0, 0.0);
+            }
+            fft.process_with_scratch(&mut buf, &mut scratch);
+            for (m, c) in mag.iter_mut().zip(&buf[..bins]) {
+                *m = (1.0 + 100.0 * c.norm()).ln();
+            }
+            out(f, &mag);
         }
-        fft.process(&mut buf);
-        for (m, c) in mag.iter_mut().zip(&buf[..bins]) {
-            *m = (1.0 + 100.0 * c.norm()).ln();
+    };
+
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(12);
+    if threads <= 1 || frames < PARALLEL_MIN_FRAMES {
+        compute(0..frames, &mut per_frame);
+        return;
+    }
+    let chunk = frames.div_ceil(threads);
+    let results: Vec<Vec<f32>> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = (0..threads)
+            .map(|t| {
+                let range = (t * chunk).min(frames)..((t + 1) * chunk).min(frames);
+                let compute = &compute;
+                scope.spawn(move || {
+                    let mut out = Vec::with_capacity(range.len() * bins);
+                    compute(range, &mut |_, mag| out.extend_from_slice(mag));
+                    out
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().expect("STFT worker")).collect()
+    });
+    let mut f = 0;
+    for out in &results {
+        for mag in out.chunks_exact(bins) {
+            per_frame(f, mag);
+            f += 1;
         }
-        per_frame(f, &mag);
     }
 }
+
+/// Below this many frames (~20 s) the STFT runs on the calling thread.
+const PARALLEL_MIN_FRAMES: usize = 2_000;
 
 /// Subtracts a centred moving average (±`half` frames), removing slow
 /// loudness trends so only short-term changes remain.

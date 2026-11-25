@@ -287,12 +287,19 @@ fn track_beats(env: &[f32], period: f32) -> Vec<usize> {
     let hi = (period * 2.0).round() as usize;
     let mut cum = vec![0.0f32; n];
     let mut back = vec![usize::MAX; n];
+    // The penalty depends only on the gap t - tau: work it out once per gap
+    // (same expression, so the same values) instead of per pair.
+    let cost: Vec<f32> = (0..=hi)
+        .map(|d| {
+            let penalty = (d as f32 / period).ln();
+            TIGHTNESS * penalty * penalty
+        })
+        .collect();
     for t in 0..n {
         let mut best = (f32::MIN, usize::MAX);
         if t >= lo {
             for tau in t.saturating_sub(hi)..=t - lo {
-                let penalty = ((t - tau) as f32 / period).ln();
-                let v = cum[tau] - TIGHTNESS * penalty * penalty;
+                let v = cum[tau] - cost[t - tau];
                 if v > best.0 {
                     best = (v, tau);
                 }

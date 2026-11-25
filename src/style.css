@@ -18,6 +18,8 @@
  *      Exceptions: 1px hairlines, the 4px dark frame around the sheet.
  *   2. Safe space. Sheet and cards: 24px radius, 24px inset. Inside a card,
  *      groups are 16px apart; items within a group 8px.
+ *   (vizia only parses `inset` at the end of a box-shadow; shadows are drawn
+ *   on every redraw, so use them sparingly: one layer, real elements only.)
  *   3. Structure. Nested radii step down: card 24, tile 16, waveform frame 8.
  *      Buttons, fields and toggles are fully round (half their height:
  *      32 → 16, 40 → 20, 24 → 12).
@@ -84,7 +86,6 @@ icon {
   size: 24px;
   border-radius: 8px;
   background-image: linear-gradient(to bottom, #ffffff, #d9d9d9);
-  box-shadow: 0px 1px 3px #00000099, inset 0px -1px 0px #0000001f;
 }
 .brand-mark icon {
   color: #0b0b0b;
@@ -96,7 +97,6 @@ icon {
   border-width: 1px;
   border-color: #262626;
   border-radius: 16px;
-  box-shadow: inset 0px 1px 3px #000000b3, 0px 1px 0px #ffffff0a;
 }
 .search textbox {
   height: 30px;
@@ -151,7 +151,7 @@ press-drag.row:checked {
   background-color: #262626;
   border-width: 1px;
   border-color: #ffffff14;
-  box-shadow: 0px 1px 3px #00000099, inset 0px 1px 0px #ffffff0d;
+  box-shadow: 0px 1px 3px #00000099;
 }
 press-drag.row .name {
   font-size: 13;
@@ -197,7 +197,6 @@ press-drag.row.muted .meta {
   border-width: 0px;
   border-radius: 16px;
   col-between: 8px;
-  box-shadow: 0px 0px 0px #00000000;
   child-right: 1s;
 }
 .nav-item:over {
@@ -263,7 +262,6 @@ button {
   border-width: 1px;
   border-color: #dedede;
   border-radius: 16px;
-  box-shadow: 0px 1px 0px #00000012, 0px 1px 2px #0000000d, inset 0px -1px 0px #0000000f;
   transition: background-color 100ms;
 }
 button label {
@@ -279,7 +277,6 @@ button:over {
 }
 button:active {
   background-color: #f1f1f1;
-  box-shadow: inset 0px 1px 2px #0000001f;
 }
 
 /* Small round icon-only button (Show in Finder beside the title). */
@@ -289,7 +286,6 @@ button.icon-button {
   border-radius: 16px;
   background-color: #00000000;
   border-color: #00000000;
-  box-shadow: 0px 0px 0px #00000000;
 }
 button.icon-button:over {
   background-color: #e3e3e3;
@@ -321,7 +317,7 @@ button.icon-button icon {
 .whole-song:checked {
   background-color: #ffffff;
   border-color: #00000014;
-  box-shadow: 0px 1px 2px #00000024, 0px 2px 6px #0000000f;
+  box-shadow: 0px 1px 3px #00000029;
 }
 .card-title .whole-song:checked label {
   color: #303030;
@@ -333,7 +329,6 @@ button.icon-button icon {
   height: 32px;
   width: auto;
   background-color: #f1f1f1;
-  box-shadow: inset 0px 1px 2px #0000000f, inset 0px 0px 0px 1px #e6e6e6;
   border-radius: 16px;
   child-space: 4px;
   col-between: 4px;
@@ -345,7 +340,6 @@ button.icon-button icon {
   background-color: #00000000;
   border-width: 0px;
   border-radius: 12px;
-  box-shadow: 0px 0px 0px #00000000;
 }
 .segmented button label {
   color: #616161;
@@ -356,7 +350,7 @@ button.icon-button icon {
 }
 .segmented button:checked {
   background-color: #ffffff;
-  box-shadow: 0px 1px 2px #00000024, 0px 2px 6px #0000000f;
+  box-shadow: 0px 1px 3px #00000029;
 }
 .segmented button:checked label {
   color: #303030;
@@ -371,7 +365,6 @@ button.icon-button icon {
   transition: background-color 100ms;
   background-color: #f3f3f3;
   border-color: #e2e2e2;
-  box-shadow: inset 0px 1px 3px #00000014;
 }
 .stem:over {
   background-color: #efefef;
@@ -379,7 +372,7 @@ button.icon-button icon {
 .stem:checked {
   background-color: #ffffff;
   border-color: #d6d6d6;
-  box-shadow: 0px 1px 2px #00000017, 0px 3px 10px #0000000f, inset 0px 1px 0px #ffffff;
+  box-shadow: 0px 1px 3px #0000001f;
 }
 .stem:checked:over {
   background-color: #fcfcfc;
@@ -400,7 +393,6 @@ button.icon-button icon {
   border-width: 1px;
   border-color: #c2c2c2;
   background-color: #e9e9e9;
-  box-shadow: inset 0px 1px 1px #0000001f;
 }
 .stem:checked .led.drums {
   background-color: #f49342;
@@ -427,7 +419,6 @@ button.icon-button icon {
 .stem.disabled {
   background-color: #f6f6f6;
   border-color: #ececec;
-  box-shadow: 0px 0px 0px #00000000;
 }
 .stem.disabled .stem-name {
   color: #c4c4c4;
@@ -435,7 +426,6 @@ button.icon-button icon {
 .stem.disabled .led {
   background-color: #f1f1f1;
   border-color: #dcdcdc;
-  box-shadow: 0px 0px 0px #00000000;
 }
 
 /* Cards: 24 radius, 24 inset. The edge is drawn by shadows (no border) so
@@ -443,7 +433,7 @@ button.icon-button icon {
 .card {
   background-color: #ffffff;
   border-radius: 24px;
-  box-shadow: 0px 0px 1px #00000040, 0px 1px 2px #0000000f, 0px 8px 16px #0000000a;
+  box-shadow: 0px 0px 1px #00000040, 0px 4px 12px #0000000f;
   child-space: 24px;
   row-between: 16px;
 }
@@ -474,7 +464,6 @@ chop-tile {
   background-color: #ffffff;
   border-width: 1px;
   border-color: #e6e6e6;
-  box-shadow: 0px 1px 2px #0000000d;
   border-radius: 16px;
   child-space: 8px;
   row-between: 8px;
@@ -482,13 +471,13 @@ chop-tile {
 }
 chop-tile:over {
   border-color: #d2d2d2;
-  box-shadow: 0px 2px 8px #00000014, 0px 1px 2px #0000000f;
+  box-shadow: 0px 2px 8px #00000014;
 }
 chop-tile:checked {
   background-color: #ffffff;
   border-width: 2px;
   border-color: #1a1a1a;
-  box-shadow: 0px 4px 16px #0000001f, 0px 1px 3px #00000014;
+  box-shadow: 0px 4px 16px #0000001f;
 }
 /* Recessed panel framing each waveform: 8 radius. The waveform runs to the
    panel's side edges; 8 above and below. */
@@ -497,7 +486,6 @@ chop-tile:checked {
   border-width: 1px;
   border-color: #e9e9e9;
   border-radius: 8px;
-  box-shadow: inset 0px 1px 2px #0000000d;
   child-left: 0px;
   child-right: 0px;
   child-top: 8px;

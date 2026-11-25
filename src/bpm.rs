@@ -123,7 +123,28 @@ const WEAK_RHYTHM: f32 = 0.045;
 /// The classic failure is half or double the real tempo; the GUI has
 /// ½× / 2× buttons for that.
 pub fn detect_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
-    let a = analyse(mono, sample_rate)?;
+    pick_tempo(analyse(mono, sample_rate)?)
+}
+
+/// `detect_bpm` given only the analysis window (see [`analysis_window`]) of
+/// a file `secs` long: the same result, without decoding the whole file.
+pub fn detect_bpm_window(window: &[f32], sample_rate: u32, secs: f32) -> Option<f32> {
+    pick_tempo(analyse_window(window, sample_rate, secs)?)
+}
+
+/// The part of a file of `frames` frames that tempo detection looks at:
+/// (start, length) in frames. Long files use a window from the middle
+/// (intros and outros are often beatless).
+pub fn analysis_window(frames: usize, sample_rate: u32) -> (usize, usize) {
+    let max_len = (ANALYSIS_MAX_SECS * sample_rate as f32) as usize;
+    if frames > max_len {
+        ((frames - max_len) / 2, max_len)
+    } else {
+        (0, frames)
+    }
+}
+
+fn pick_tempo(a: Analysis) -> Option<f32> {
     if a.free.1 < WEAK_RHYTHM && !a.bar_candidates.is_empty() {
         let by_prior = a
             .bar_candidates
@@ -153,20 +174,16 @@ pub fn detect_bpm(mono: &[f32], sample_rate: u32) -> Option<f32> {
 /// 4. For short files, also score the tempos their length allows.
 pub fn analyse(mono: &[f32], sample_rate: u32) -> Option<Analysis> {
     let secs = mono.len() as f32 / sample_rate as f32;
+    let (start, len) = analysis_window(mono.len(), sample_rate);
+    analyse_window(&mono[start..start + len], sample_rate, secs)
+}
+
+/// [`analyse`] given just the analysis window of a file `secs` long.
+pub fn analyse_window(audio: &[f32], sample_rate: u32, secs: f32) -> Option<Analysis> {
     if secs < 1.0 {
         return None; // a one-shot
     }
     let maybe_loop = secs <= LOOP_MAX_SECS;
-
-    // Long files: analyse a window from the middle (intros and outros are
-    // often beatless).
-    let max_len = (ANALYSIS_MAX_SECS * sample_rate as f32) as usize;
-    let audio = if mono.len() > max_len {
-        let start = (mono.len() - max_len) / 2;
-        &mono[start..start + max_len]
-    } else {
-        mono
-    };
 
     let hop = hop_size(sample_rate);
     let frame_rate = sample_rate as f32 / hop as f32;
@@ -260,7 +277,15 @@ fn autocorr(x: &[f32], max_lag: usize, circular: bool) -> Vec<f32> {
     (0..=max_lag)
         .map(|lag| {
             if circular {
-                (0..n).map(|i| x[i] * x[(i + lag) % n]).sum::<f32>() / n as f32
+                // Same terms in the same order as summing x[i]·x[(i+lag)%n],
+                // without a division per term.
+                let lag = lag % n.max(1);
+                let head = n - lag;
+                (0..head)
+                    .map(|i| x[i] * x[i + lag])
+                    .chain((0..lag).map(|i| x[head + i] * x[i]))
+                    .sum::<f32>()
+                    / n as f32
             } else {
                 let m = n - lag;
                 (0..m).map(|i| x[i] * x[i + lag]).sum::<f32>() / m.max(1) as f32
