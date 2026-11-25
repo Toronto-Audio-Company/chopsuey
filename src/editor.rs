@@ -693,21 +693,33 @@ fn marquee_name<L: Lens<Target = String>>(cx: &mut Context, name: L, index: usiz
             .text_wrap(false)
             .hoverable(false)
             // Translation moves only the drawing, not the layout.
-            .translate(AppData::root.map(move |d| {
-                let x = match (&d.hover, d.rows.get(index)) {
-                    (Some((key, since)), Some(row)) if *key == row.key => {
-                        marquee_offset(row.overflow, since.elapsed().as_secs_f32())
-                    }
-                    _ => 0.0,
-                };
-                Translate::new(Length::px(-x), Length::px(0.0))
-            }));
+            .translate(AppData::root.map(move |d| Translate::new(Length::px(-marquee_x(d, index)), Length::px(0.0))));
+        // While scrolled, the start is cut off too: fade that edge like the
+        // end. Shown only while the name is scrolled away from its start.
+        Element::new(cx)
+            .class("fade-left")
+            .position_type(PositionType::SelfDirected)
+            .left(Pixels(0.0))
+            .top(Pixels(0.0))
+            .width(Pixels(24.0))
+            .height(Percentage(100.0))
+            .toggle_class("hidden", AppData::root.map(move |d| marquee_x(d, index) < 1.0))
+            .hoverable(false);
     })
     .width(Stretch(1.0))
     .min_width(Pixels(0.0))
     .height(Auto)
     .overflow(Overflow::Hidden)
     .hoverable(false);
+}
+
+/// How far row `index`'s name is scrolled right now (0 unless hovered and
+/// too long to fit).
+fn marquee_x(d: &AppData, index: usize) -> f32 {
+    match (&d.hover, d.rows.get(index)) {
+        (Some((key, since)), Some(row)) if *key == row.key => marquee_offset(row.overflow, since.elapsed().as_secs_f32()),
+        _ => 0.0,
+    }
 }
 
 /// Marquee position after `t` seconds of hover for a name `dist` px too

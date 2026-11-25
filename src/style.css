@@ -188,6 +188,16 @@ press-drag.row:over .fade {
 press-drag.row:checked .fade {
   background-image: linear-gradient(to right, #26262600, #262626);
 }
+/* The start of a scrolling name fades the same way, mirrored. */
+.fade-left {
+  background-image: linear-gradient(to left, #0b0b0b00, #0b0b0b);
+}
+press-drag.row:over .fade-left {
+  background-image: linear-gradient(to left, #1c1c1c00, #1c1c1c);
+}
+press-drag.row:checked .fade-left {
+  background-image: linear-gradient(to left, #26262600, #262626);
+}
 press-drag.row.muted .name,
 press-drag.row.muted .meta {
   color: #5a5a5a;
