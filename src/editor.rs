@@ -1045,7 +1045,8 @@ fn chops_card(cx: &mut Context, shared: Arc<Shared>, view: Arc<crate::SongView>)
                 Label::new(cx, "Whole song").hoverable(false);
             })
             .class("whole-song")
-            .checked(AppData::selected_chop.map(|c| *c < 0));
+            // Raised only while held (playing), like the tiles.
+            .checked(AppData::root.map(|d| d.selected_chop < 0 && d.shared.preview.load(Ordering::Relaxed)));
         }))
         .class("card-title")
         .col_between(Pixels(8.0));
@@ -1253,7 +1254,8 @@ impl ChopTile {
                         // stem switches change its waveform. Atomics only.
                         .bind(
                             AppData::root.map(move |d| {
-                                let selected = d.selected_chop == index as i64;
+                                let selected =
+                                    d.selected_chop == index as i64 && d.shared.preview.load(Ordering::Relaxed);
                                 let playhead = if selected {
                                     (d.shared.playhead.load(Ordering::Relaxed) * 4000.0) as i64
                                 } else {
@@ -1267,7 +1269,9 @@ impl ChopTile {
                 Label::new(cx, &label).text_wrap(false).height(Pixels(16.0)).hoverable(false);
             })
             .width(Stretch(1.0))
-            .checked(AppData::selected_chop.map(move |s| *s == index as i64))
+            // Highlighted only while it's held and playing; the choice is
+            // still remembered (for the export button) without showing.
+            .checked(AppData::root.map(move |d| d.selected_chop == index as i64 && d.shared.preview.load(Ordering::Relaxed)))
     }
 }
 
@@ -1321,8 +1325,9 @@ impl View for ChopWave {
             return;
         }
 
-        // Selected chop in the accent colour, others in a quiet grey.
-        let colour = if selected == Some(self.index) {
+        // The chop being held (playing) in the accent colour, others grey.
+        let held = selected == Some(self.index) && self.shared.preview.load(Ordering::Relaxed);
+        let colour = if held {
             vg::Color::rgb(0x1a, 0x1a, 0x1a)
         } else {
             vg::Color::rgb(0x8a, 0x8a, 0x8a)
@@ -1331,7 +1336,7 @@ impl View for ChopWave {
 
         // Playhead, if this chop is the one previewing.
         let p = self.shared.playhead.load(Ordering::Relaxed);
-        if selected == Some(self.index) && p >= 0.0 && view.frames > 0 {
+        if held && p >= 0.0 && view.frames > 0 {
             let (a, z) = (chop.start as f32 / view.frames as f32, chop.end as f32 / view.frames as f32);
             if z > a && (a..=z).contains(&p) {
                 let x = b.x + b.w * (p - a) / (z - a);
