@@ -466,7 +466,7 @@ fn cached_entries(config: &Config) -> Vec<Entry> {
 }
 
 /// Runs `f` over `items` on `threads` threads; results keep the input order.
-fn parallel_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> Option<R> + Sync) -> Vec<R> {
+pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> Option<R> + Sync) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out = Mutex::new(Vec::with_capacity(items.len()));
     std::thread::scope(|s| {

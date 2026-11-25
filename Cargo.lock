@@ -4310,6 +4310,7 @@ dependencies = [
  "signalsmith-stretch",
  "symphonia",
  "tracing-subscriber",
+ "ttf-parser 0.19.2",
 ]
 
 [[package]]

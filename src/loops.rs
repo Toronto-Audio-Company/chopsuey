@@ -41,6 +41,16 @@ pub struct RenderedLoop {
     /// Only the start of a song, published so it can play while the rest is
     /// still stretching. Never exported.
     pub partial: bool,
+    /// `key_hash(key)`, so the audio thread can check it's the wanted clip.
+    pub key_hash: u64,
+}
+
+/// A non-zero hash of a render key (0 means "any clip" to the audio thread).
+pub fn key_hash(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish() | 1
 }
 
 impl LoopAsset {
@@ -304,6 +314,7 @@ impl LoopAsset {
             sample_rate: self.sample_rate,
             samples,
             partial,
+            key_hash: key_hash(&self.key),
         }
     }
 }
@@ -548,6 +559,7 @@ mod tests {
             sample_rate: 48_000,
             samples: vec![],
             partial: false,
+            key_hash: 0,
         };
         assert_eq!(mk(71.0).file_name(), "Test Loop - 71 BPM.wav");
         assert_eq!(mk(92.5).file_name(), "Test Loop - 92.5 BPM.wav");

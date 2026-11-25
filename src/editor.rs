@@ -71,6 +71,10 @@ struct AppData {
     /// it exports that (and not a previous selection).
     #[lens(ignore)]
     press_selected: bool,
+    /// Key of the sidebar row under the mouse and since when (drives the
+    /// marquee). By key, not position: rows move while tempos are detected.
+    #[lens(ignore)]
+    hover: Option<(String, std::time::Instant)>,
 }
 
 #[derive(Clone, Data, Lens)]
@@ -94,6 +98,9 @@ struct Row {
     source: String,
     usable: bool,
     selected: bool,
+    /// How far the name scrolls (px) when hovered, to show what's cut off;
+    /// 0 when it fits.
+    overflow: f32,
 }
 
 #[derive(Clone)]
@@ -115,6 +122,9 @@ enum AppEvent {
     Audition,
     /// The mouse was let go: previews play only while held.
     StopPreview,
+    /// The mouse entered / left sidebar row n (for the name marquee).
+    HoverRow(usize),
+    UnhoverRow(usize),
     ShowInFinder,
     /// Drag after pressing a row or tile (only if the press selected it).
     StartDrag,
@@ -155,6 +165,7 @@ impl AppData {
             source: e.source.label().into(),
             usable: e.usable(),
             selected: e.key == self.selected_key,
+            overflow: 0.0,
         };
 
         // Folder tree: library roots, then their subfolders, by path.
@@ -222,6 +233,7 @@ impl AppData {
                 source: String::new(),
                 usable: true,
                 selected: false,
+                overflow: 0.0,
             });
             if !open {
                 return;
@@ -238,6 +250,9 @@ impl AppData {
             (&sample, &self.toggled_folders, searching);
         for (key, (name, node)) in &tree {
             walk(name, key.clone(), node, 0, &mut rows, &ctx);
+        }
+        for row in &mut rows {
+            row.overflow = name_overflow(row);
         }
         self.rows = rows;
         self.sample_count = sample_count;
@@ -264,6 +279,7 @@ impl AppData {
         let tempo = self.shared.transport.tempo.load(Ordering::Relaxed);
         // Before the host has reported a tempo the audio thread will request
         // the first render itself.
+        self.shared.want_selection();
         if tempo > 0.0 {
             let id = self.shared.next_request();
             self.executor.execute_background(Task::Render { id, bpm: tempo });
@@ -329,6 +345,7 @@ impl Model for AppData {
             AppEvent::SetChopLength(bars) => {
                 self.chop_length = *bars;
                 self.shared.chop_length.store(*bars, Ordering::Relaxed);
+                self.shared.refresh_pads(); // pads play the tiles shown
             }
             AppEvent::SelectChop(index) => {
                 self.press_selected = false;
@@ -429,6 +446,17 @@ impl Model for AppData {
             AppEvent::Rescan => self.shared.library.rescan(),
             AppEvent::StopPreview => {
                 self.shared.preview.store(false, Ordering::Relaxed);
+            }
+            AppEvent::HoverRow(i) => {
+                if let Some(row) = self.rows.get(*i) {
+                    self.hover = Some((row.key.clone(), std::time::Instant::now()));
+                }
+            }
+            AppEvent::UnhoverRow(i) => {
+                let key = self.rows.get(*i).map(|r| &r.key);
+                if self.hover.as_ref().is_some_and(|(h, _)| Some(h) == key) {
+                    self.hover = None;
+                }
             }
             AppEvent::Audition => {
                 self.message.clear();
@@ -570,6 +598,11 @@ pub(crate) fn create(
             selected_is_song: false,
             selected_is_loop: false,
             selected_scale: 1.0,
+            // Development: TEMPO_SAMPLER_DEMO_HOVER=<key> starts as if that
+            // sidebar row were hovered (to see the marquee in screenshots).
+            hover: std::env::var("TEMPO_SAMPLER_DEMO_HOVER")
+                .ok()
+                .map(|key| (key, std::time::Instant::now())),
             toggled_folders: Default::default(),
             sample_count: 0,
             message: String::new(),
@@ -650,6 +683,89 @@ const TEXT_LINE: f32 = ICON_COLUMN + ICON_SIZE + ICON_GAP;
 const INDENT: f32 = ICON_SIZE + ICON_GAP;
 const BRAND_MARK: f32 = 24.0;
 
+/// A sidebar row's name, clipped to the row. While the row is hovered, a
+/// name that doesn't fit scrolls to show the rest, car-stereo style.
+fn marquee_name<L: Lens<Target = String>>(cx: &mut Context, name: L, index: usize) {
+    HStack::new(cx, |cx| {
+        Label::new(cx, name)
+            .class("name")
+            .width(Auto)
+            .text_wrap(false)
+            .hoverable(false)
+            // Translation moves only the drawing, not the layout.
+            .translate(AppData::root.map(move |d| {
+                let x = match (&d.hover, d.rows.get(index)) {
+                    (Some((key, since)), Some(row)) if *key == row.key => {
+                        marquee_offset(row.overflow, since.elapsed().as_secs_f32())
+                    }
+                    _ => 0.0,
+                };
+                Translate::new(Length::px(-x), Length::px(0.0))
+            }));
+    })
+    .width(Stretch(1.0))
+    .min_width(Pixels(0.0))
+    .height(Auto)
+    .overflow(Overflow::Hidden)
+    .hoverable(false);
+}
+
+/// Marquee position after `t` seconds of hover for a name `dist` px too
+/// long: wait, scroll to the end, hold, scroll back, repeat.
+fn marquee_offset(dist: f32, t: f32) -> f32 {
+    const WAIT: f32 = 0.8;
+    const HOLD: f32 = 1.2;
+    const SPEED: f32 = 30.0; // px per second
+    if dist <= 0.0 {
+        return 0.0;
+    }
+    let travel = dist / SPEED;
+    let t = t % (WAIT + travel + HOLD + travel);
+    let x = if t < WAIT {
+        0.0
+    } else if t < WAIT + travel {
+        (t - WAIT) * SPEED
+    } else if t < WAIT + travel + HOLD {
+        dist
+    } else {
+        dist - (t - WAIT - travel - HOLD) * SPEED
+    };
+    (x * 2.0).round() / 2.0 // half-pixel steps: fewer redraws, still smooth
+}
+
+/// Width of `text` in Inter at `size` px (sum of glyph advances).
+fn text_width(text: &str, size: f32, bold: bool) -> f32 {
+    static FACES: std::sync::OnceLock<(ttf_parser::Face<'static>, ttf_parser::Face<'static>)> = std::sync::OnceLock::new();
+    let (regular, heavy) = FACES.get_or_init(|| {
+        (
+            ttf_parser::Face::parse(include_bytes!("../assets/fonts/Inter-Regular.ttf"), 0).expect("Inter"),
+            ttf_parser::Face::parse(include_bytes!("../assets/fonts/Inter-Bold.ttf"), 0).expect("Inter"),
+        )
+    });
+    let face = if bold { heavy } else { regular };
+    let units: u32 = text
+        .chars()
+        .map(|c| face.glyph_index(c).and_then(|g| face.glyph_hor_advance(g)).unwrap_or(0) as u32)
+        .sum();
+    units as f32 * size / face.units_per_em() as f32
+}
+
+/// How far a row's name must scroll to show its end clear of the fade
+/// (0 if it fits). Widths follow the row layout in `sidebar`.
+fn name_overflow(row: &Row) -> f32 {
+    const LIST: f32 = 288.0; // style.css `virtual_list ... vstack`
+    const FADE: f32 = 24.0;
+    let depth = row.depth as f32 * INDENT;
+    let room = if row.is_folder {
+        let count = text_width(&row.count, 11.0, false);
+        LIST - (ICON_COLUMN + depth) - ICON_SIZE - ICON_GAP * 3.0 - count - ICON_COLUMN
+    } else {
+        LIST - (TEXT_LINE + depth) - ICON_COLUMN
+    };
+    let text = text_width(&row.name, 13.0, row.is_folder);
+    if text > room { text - room + FADE } else { 0.0 }
+}
+
 /// A short gradient laid over the end of the text before it, so text cut
 /// off by its container fades out instead of stopping mid-letter. It goes
 /// right after the label in a row and overlaps its last 24px; its colour
@@ -719,12 +835,7 @@ fn sidebar(cx: &mut Context) {
                         row.then(Row::expanded).map(|e| if *e { ICON_FOLDER_OPEN } else { ICON_FOLDER }),
                     )
                     .hoverable(false);
-                    Label::new(cx, row.then(Row::name))
-                        .class("name")
-                        .width(Stretch(1.0))
-                        .text_wrap(false)
-                        .overflow(Overflow::Hidden)
-                        .hoverable(false);
+                    marquee_name(cx, row.then(Row::name), index);
                     fade(cx);
                     Label::new(cx, row.then(Row::count)).class("folder-count").hoverable(false);
                 }))
@@ -739,15 +850,11 @@ fn sidebar(cx: &mut Context) {
                 // names are clipped inside the highlight, under a fade.
                 HStack::new(cx, |cx| {
                     VStack::new(cx, |cx| {
-                        Label::new(cx, row.then(Row::name))
-                            .class("name")
-                            .width(Stretch(1.0))
-                            .text_wrap(false)
-                            .overflow(Overflow::Hidden)
-                            .hoverable(false);
+                        marquee_name(cx, row.then(Row::name), index);
                         Label::new(cx, row.then(Row::meta))
                             .class("meta")
                             .width(Stretch(1.0))
+                            .min_width(Pixels(0.0))
                             .text_wrap(false)
                             .overflow(Overflow::Hidden)
                             .hoverable(false);
@@ -1218,6 +1325,13 @@ fn draw_overview(canvas: &mut Canvas, b: BoundingBox, overview: &[(f32, f32)], c
     canvas.fill_path(&path, &vg::Paint::color(colour));
 }
 
+/// Whether chop tile `index` is playing: held with the mouse, or its MIDI pad
+/// is down. Only then does it look selected.
+fn tile_playing(d: &AppData, index: usize) -> bool {
+    (d.selected_chop == index as i64 && d.shared.preview.load(Ordering::Relaxed))
+        || d.shared.pad_playing.load(Ordering::Relaxed) == index as i64
+}
+
 /// 1-based position of chop `index` among chops of the same length.
 fn chop_number(chops: &[crate::chops::Chop], index: usize) -> usize {
     let bars = chops[index].bars;
@@ -1254,8 +1368,7 @@ impl ChopTile {
                         // stem switches change its waveform. Atomics only.
                         .bind(
                             AppData::root.map(move |d| {
-                                let selected =
-                                    d.selected_chop == index as i64 && d.shared.preview.load(Ordering::Relaxed);
+                                let selected = tile_playing(d, index);
                                 let playhead = if selected {
                                     (d.shared.playhead.load(Ordering::Relaxed) * 4000.0) as i64
                                 } else {
@@ -1271,7 +1384,7 @@ impl ChopTile {
             .width(Stretch(1.0))
             // Highlighted only while it's held and playing; the choice is
             // still remembered (for the export button) without showing.
-            .checked(AppData::root.map(move |d| d.selected_chop == index as i64 && d.shared.preview.load(Ordering::Relaxed)))
+            .checked(AppData::root.map(move |d| tile_playing(d, index)))
     }
 }
 
@@ -1326,7 +1439,8 @@ impl View for ChopWave {
         }
 
         // The chop being held (playing) in the accent colour, others grey.
-        let held = selected == Some(self.index) && self.shared.preview.load(Ordering::Relaxed);
+        let held = (selected == Some(self.index) && self.shared.preview.load(Ordering::Relaxed))
+            || self.shared.pad_playing.load(Ordering::Relaxed) == self.index as i64;
         let colour = if held {
             vg::Color::rgb(0x1a, 0x1a, 0x1a)
         } else {
@@ -1404,6 +1518,13 @@ impl View for PressDrag {
     }
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        if let AppEvent::Select(i) = self.on_press {
+            event.map(|window_event, _| match window_event {
+                WindowEvent::MouseEnter => cx.emit(AppEvent::HoverRow(i)),
+                WindowEvent::MouseLeave => cx.emit(AppEvent::UnhoverRow(i)),
+                _ => {}
+            });
+        }
         self.hold.event(cx, event, self.on_press.clone());
     }
 }

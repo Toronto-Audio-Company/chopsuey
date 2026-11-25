@@ -23,6 +23,7 @@ rustfft = "6"
 ort = { version = "=2.0.0-rc.13", features = ["coreml", "webgpu"] }
 libc = "0.2"
 symphonia = { version = "0.6", features = ["all"] }
+ttf-parser = "0.19" # measuring sidebar names for the hover marquee
 
 [profile.release]
 lto = "thin"
