@@ -4,17 +4,13 @@ A VST3 instrument (Rust, nih-plug + vizia), formerly "Tempo Sampler", that reads
 
 ## Build and install (macOS)
 
-The stem separation model isn't in git (166 MB). Download it once:
-
-```bash
-mkdir -p models && curl -L -o models/htdemucs_fp16weights.onnx https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs_fp16weights.onnx
-```
-
-Then test, bundle (with the model and the WebGPU library `libwebgpu_dawn.dylib` inside the VST3), sign and install:
+One command downloads the stem separation model (166 MB, first time only), runs the tests, builds the plugin and installs it where Ableton looks for VST3s:
 
 ```bash
 scripts/install.sh
 ```
+
+You need Rust ([rustup.rs](https://rustup.rs)). Run it again after pulling changes; the model is only downloaded once (to `models/`, which isn't in git).
 
 In Ableton: Settings → Plug-Ins → turn on "Use VST3 Plug-in Custom Folder" or the system folder, then Rescan. Restart Live after reinstalling a changed build (Live keeps the old binary loaded).
 

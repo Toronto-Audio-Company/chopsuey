@@ -1,20 +1,35 @@
 #!/usr/bin/env bash
-# Builds, tests and installs chopsuey as a VST3 for the current user.
+# Downloads the stem model (first time only), then tests, builds and
+# installs chopsuey as a VST3 for the current user, all in one go.
 #
 #   scripts/install.sh
 #
-# Stops without installing if any test fails. Expects the stem model at
-# models/htdemucs_fp16weights.onnx (not in git; see README).
+# Stops without installing if any test fails.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL=models/htdemucs_fp16weights.onnx
+MODEL_URL=https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs_fp16weights.onnx
 BUNDLE="target/bundled/chopsuey.vst3"
 DEST="$HOME/Library/Audio/Plug-Ins/VST3"
 
-if [[ ! -f "$MODEL" ]]; then
-  echo "Missing $MODEL (the stem separation model). See README." >&2
+if ! command -v cargo >/dev/null; then
+  echo "Rust isn't installed. Get it from https://rustup.rs, then run this again." >&2
   exit 1
+fi
+
+# The stem separation model isn't in git (166 MB): fetch it once. It goes to
+# a temporary name first so an interrupted download is never mistaken for
+# the real file.
+if [[ ! -f "$MODEL" ]]; then
+  echo "== Downloading the stem model (166 MB, first time only)"
+  mkdir -p models
+  curl -fL --progress-bar -o "$MODEL.part" "$MODEL_URL"
+  if (( $(stat -f%z "$MODEL.part") < 100000000 )); then
+    echo "The download looks wrong (too small). Delete $MODEL.part and try again." >&2
+    exit 1
+  fi
+  mv "$MODEL.part" "$MODEL"
 fi
 
 echo "== Testing"
