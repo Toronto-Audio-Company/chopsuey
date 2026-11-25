@@ -31,6 +31,9 @@ pub struct Config {
     /// The ½× / 1× / 2× choice per file path (1× isn't stored).
     #[serde(default)]
     pub tempo_scale: HashMap<String, f32>,
+    /// Starred samples, by file path.
+    #[serde(default)]
+    pub favourites: std::collections::BTreeSet<String>,
     /// Detection results, by file path. Reused while size and mtime match.
     #[serde(default)]
     pub detected: HashMap<String, Detected>,
@@ -58,7 +61,18 @@ pub struct Detected {
     /// `bpm::DETECTOR_VERSION` that produced this; older results are redone.
     #[serde(default)]
     pub version: u32,
+    /// Musical key ("Am") and RMS level (dBFS); valid when `analysis` is
+    /// `ANALYSIS_VERSION`.
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub loudness: Option<f32>,
+    #[serde(default)]
+    pub analysis: u32,
 }
+
+/// Bump to re-analyse every file's key and loudness.
+const ANALYSIS_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BpmSource {
@@ -99,6 +113,13 @@ pub struct Entry {
     /// The user's ½× / 1× / 2× choice.
     pub scale: f32,
     pub source: BpmSource,
+    /// Musical key ("Am", "F#"), from the name or detected.
+    pub musical_key: Option<String>,
+    /// RMS level in dBFS, for loudness-matched previews.
+    pub loudness: Option<f32>,
+    pub favourite: bool,
+    /// Key and loudness haven't been worked out yet.
+    pub needs_analysis: bool,
 }
 
 /// The ½× / 1× / 2× choices.
@@ -151,6 +172,10 @@ impl Entry {
             base_bpm: Some(120.0),
             scale: 1.0,
             source: BpmSource::Builtin,
+            musical_key: None,
+            loudness: None,
+            favourite: false,
+            needs_analysis: false,
         }
     }
 }
@@ -250,6 +275,21 @@ impl Library {
         self.state.lock().unwrap().entries.iter().find(|e| e.key == key).cloned()
     }
 
+    /// Stars or un-stars a sample. Saved to disk.
+    pub fn toggle_favourite(&self, key: &str) {
+        let mut st = self.state.lock().unwrap();
+        let on = !st.config.favourites.remove(key);
+        if on {
+            st.config.favourites.insert(key.to_string());
+        }
+        if let Some(e) = st.entries.iter_mut().find(|e| e.key == key) {
+            e.favourite = on;
+        }
+        save_config(&st.config);
+        drop(st);
+        self.bump();
+    }
+
     /// Sets a sample's ½× / 1× / 2× tempo choice. Saved to disk.
     pub fn set_scale(&self, key: &str, scale: f32) {
         if key == BUILTIN_KEY {
@@ -339,7 +379,7 @@ impl Library {
         // (key, path, length, bare tempo from the name if any)
         let pending: Vec<(String, PathBuf, f32, Option<f32>)> = entries
             .iter()
-            .filter(|e| e.source == BpmSource::Pending)
+            .filter(|e| e.source == BpmSource::Pending || e.needs_analysis)
             .filter_map(|e| {
                 let hint = match bpm::bpm_from_name(&e.name) {
                     Some(NameBpm::Bare(b)) => Some(b),
@@ -370,7 +410,8 @@ impl Library {
             if self.cancelled(generation) {
                 return None::<()>;
             }
-            let detected = if *secs <= MAX_FILE_SECS { detect_file(path) } else { None };
+            let (detected, musical_key, loudness) =
+                if *secs <= MAX_FILE_SECS { detect_file(path) } else { (None, None, None) };
             // A bare number in the name ("Soul Sample 88") is trusted when
             // detection lands on it or its half/double, which also settles
             // which octave is right.
@@ -382,18 +423,36 @@ impl Library {
             let mut st = self.state.lock().unwrap();
             let scale = scale_for(&st.config, key, bpm);
             if let Some(e) = st.entries.iter_mut().find(|e| &e.key == key) {
-                e.base_bpm = bpm;
-                e.scale = scale;
-                e.bpm = bpm.map(|b| b * scale);
-                e.source = match (bpm, from_name) {
-                    (Some(_), true) => BpmSource::FileName,
-                    (Some(_), false) => BpmSource::Detected,
-                    (None, _) => BpmSource::Unknown,
-                };
+                // A tempo from the name stays; only a missing one is filled in.
+                if e.source == BpmSource::Pending {
+                    e.base_bpm = bpm;
+                    e.scale = scale;
+                    e.bpm = bpm.map(|b| b * scale);
+                    e.source = match (bpm, from_name) {
+                        (Some(_), true) => BpmSource::FileName,
+                        (Some(_), false) => BpmSource::Detected,
+                        (None, _) => BpmSource::Unknown,
+                    };
+                }
+                e.musical_key = crate::key::key_from_name(&e.name).or_else(|| musical_key.clone());
+                e.loudness = loudness;
+                e.needs_analysis = false;
             }
             if let Some((size, modified)) = file_stamp(path) {
                 let version = bpm::DETECTOR_VERSION;
-                st.config.detected.insert(key.clone(), Detected { size, modified, bpm, from_name, version });
+                st.config.detected.insert(
+                    key.clone(),
+                    Detected {
+                        size,
+                        modified,
+                        bpm,
+                        from_name,
+                        version,
+                        key: musical_key,
+                        loudness,
+                        analysis: ANALYSIS_VERSION,
+                    },
+                );
             }
             drop(st);
             self.detecting.fetch_sub(1, Ordering::Relaxed);
@@ -450,7 +509,29 @@ fn make_entry(config: &Config, path: PathBuf, secs: f32, stamp: Option<(u64, u64
     };
     let scale = scale_for(config, &key, base_bpm);
     let bpm = base_bpm.map(|b| b * scale);
-    Entry { key, path: Some(path), name, folder, secs, bpm, base_bpm, scale, source }
+    let analysed = config
+        .detected
+        .get(&key)
+        .filter(|d| d.analysis == ANALYSIS_VERSION && Some((d.size, d.modified)) == stamp);
+    let musical_key = crate::key::key_from_name(&name).or_else(|| analysed.and_then(|d| d.key.clone()));
+    let loudness = analysed.and_then(|d| d.loudness);
+    let favourite = config.favourites.contains(&key);
+    let needs_analysis = analysed.is_none();
+    Entry {
+        key,
+        path: Some(path),
+        name,
+        folder,
+        secs,
+        bpm,
+        base_bpm,
+        scale,
+        source,
+        musical_key,
+        loudness,
+        favourite,
+        needs_analysis,
+    }
 }
 
 /// Last scan's list, rebuilt from the scan cache without touching the disk.
@@ -486,9 +567,17 @@ pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], threads: usize, f: imp
 }
 
 /// Detects a file's tempo, decoding only the part detection looks at.
-fn detect_file(path: &Path) -> Option<f32> {
-    let (window, sr, secs) = crate::audio_file::decode_mono_window(path).ok()?;
-    bpm::detect_bpm_window(&window, sr, secs)
+/// Tempo, key and loudness of a file, from the window tempo detection
+/// looks at (decoding only that much).
+fn detect_file(path: &Path) -> (Option<f32>, Option<String>, Option<f32>) {
+    let Ok((window, sr, secs)) = crate::audio_file::decode_mono_window(path) else {
+        return (None, None, None);
+    };
+    (
+        bpm::detect_bpm_window(&window, sr, secs),
+        crate::key::detect_key(&window, sr),
+        Some(crate::key::loudness_db(&window)),
+    )
 }
 
 fn file_stamp(path: &Path) -> Option<(u64, u64)> {

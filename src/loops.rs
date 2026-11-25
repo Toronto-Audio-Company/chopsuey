@@ -353,20 +353,64 @@ impl RenderedLoop {
             let v = (s.clamp(-1.0, 1.0) * max) as i32;
             data.extend_from_slice(&v.to_le_bytes()[..3]);
         }
-        write_wav_pcm(&path, spec, &data)?;
+        write_wav_pcm(&path, spec, &data, &self.tempo_chunks())?;
         Ok(path)
+    }
+
+    /// The chunks that tell a DAW what this file is, as sample packs carry:
+    /// `acid` (tempo, length in beats, 4/4; how Ableton, FL and others know
+    /// the tempo of a dropped file) and, for loops, `smpl` with a loop over
+    /// the whole file.
+    pub fn tempo_chunks(&self) -> Vec<([u8; 4], Vec<u8>)> {
+        let mut acid = Vec::with_capacity(24);
+        // Flags: root note set (0x02), stretch (0x04); one-shot (0x01) off.
+        acid.extend_from_slice(&(0x02u32 | 0x04).to_le_bytes());
+        acid.extend_from_slice(&60u16.to_le_bytes()); // root note C4
+        acid.extend_from_slice(&0x8000u16.to_le_bytes()); // unknown, as written by ACID
+        acid.extend_from_slice(&0f32.to_le_bytes()); // unknown
+        acid.extend_from_slice(&(self.beats.round().max(1.0) as u32).to_le_bytes());
+        acid.extend_from_slice(&4u16.to_le_bytes()); // meter denominator
+        acid.extend_from_slice(&4u16.to_le_bytes()); // meter numerator
+        acid.extend_from_slice(&self.bpm.to_le_bytes());
+        let mut chunks = vec![(*b"acid", acid)];
+        if self.is_loop {
+            let mut smpl = Vec::with_capacity(60);
+            for v in [
+                0u32,                                     // manufacturer
+                0,                                        // product
+                (1e9 / self.sample_rate as f64) as u32,   // sample period (ns)
+                60,                                       // MIDI unity note
+                0,                                        // pitch fraction
+                0,                                        // SMPTE format
+                0,                                        // SMPTE offset
+                1,                                        // loops
+                0,                                        // sampler data
+                0,                                        // loop: cue id
+                0,                                        // forward
+                0,                                        // start frame
+                self.frames().saturating_sub(1) as u32,   // end frame (inclusive)
+                0,                                        // fraction
+                0,                                        // play count (forever)
+            ] {
+                smpl.extend_from_slice(&v.to_le_bytes());
+            }
+            chunks.push((*b"smpl", smpl));
+        }
+        chunks
     }
 }
 
 /// Writes a plain integer PCM WAV (`spec.bits_per_sample`, packed): RIFF
-/// header, `fmt ` chunk, then `data` (already little-endian samples).
-pub fn write_wav_pcm(path: &Path, spec: hound::WavSpec, data: &[u8]) -> std::io::Result<()> {
+/// header, `fmt ` chunk, any `extra` chunks, then `data` (already
+/// little-endian samples).
+pub fn write_wav_pcm(path: &Path, spec: hound::WavSpec, data: &[u8], extra: &[([u8; 4], Vec<u8>)]) -> std::io::Result<()> {
     let ch = spec.channels as u32;
     let bytes = spec.bits_per_sample as u32 / 8;
     let block = ch * bytes;
+    let extra_len: u32 = extra.iter().map(|(_, c)| 8 + c.len() as u32 + (c.len() as u32 & 1)).sum();
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     f.write_all(b"RIFF")?;
-    f.write_all(&(36 + data.len() as u32).to_le_bytes())?;
+    f.write_all(&(36 + extra_len + data.len() as u32).to_le_bytes())?;
     f.write_all(b"WAVEfmt ")?;
     f.write_all(&16u32.to_le_bytes())?;
     f.write_all(&1u16.to_le_bytes())?; // PCM
@@ -375,6 +419,14 @@ pub fn write_wav_pcm(path: &Path, spec: hound::WavSpec, data: &[u8]) -> std::io:
     f.write_all(&(spec.sample_rate * block).to_le_bytes())?;
     f.write_all(&(block as u16).to_le_bytes())?;
     f.write_all(&spec.bits_per_sample.to_le_bytes())?;
+    for (id, chunk) in extra {
+        f.write_all(id)?;
+        f.write_all(&(chunk.len() as u32).to_le_bytes())?;
+        f.write_all(chunk)?;
+        if chunk.len() % 2 == 1 {
+            f.write_all(&[0])?; // chunks are word-aligned
+        }
+    }
     f.write_all(b"data")?;
     f.write_all(&(data.len() as u32).to_le_bytes())?;
     f.write_all(data)?;
@@ -512,6 +564,16 @@ mod tests {
         let read: Vec<i32> = reader.into_samples::<i32>().map(|s| s.unwrap()).collect();
         assert_eq!(read.len(), r.samples.len());
         assert!(read.iter().zip(&r.samples).all(|(&v, s)| v == (s.clamp(-1.0, 1.0) * max) as i32));
+
+        // And carries its tempo and loop for the DAW.
+        let bytes = std::fs::read(&path).unwrap();
+        let find = |id: &[u8]| bytes.windows(4).position(|w| w == id).map(|i| &bytes[i + 8..]);
+        let acid = find(b"acid").expect("acid chunk");
+        assert_eq!(u32::from_le_bytes(acid[12..16].try_into().unwrap()), 8, "beats");
+        assert_eq!(f32::from_le_bytes(acid[20..24].try_into().unwrap()), 100.0, "tempo");
+        let smpl = find(b"smpl").expect("smpl chunk");
+        assert_eq!(u32::from_le_bytes(smpl[28..32].try_into().unwrap()), 1, "one loop");
+        assert_eq!(u32::from_le_bytes(smpl[48..52].try_into().unwrap()) as usize, r.frames() - 1, "loop end");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

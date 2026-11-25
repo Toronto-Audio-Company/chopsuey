@@ -345,7 +345,7 @@ pub fn save_cached(dir: &Path, stems: &Stems) -> Result<(), String> {
                     for v in s {
                         data.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
                     }
-                    crate::loops::write_wav_pcm(&path, spec, &data).map_err(|e| e.to_string())
+                    crate::loops::write_wav_pcm(&path, spec, &data, &[]).map_err(|e| e.to_string())
                 })
             })
             .collect();

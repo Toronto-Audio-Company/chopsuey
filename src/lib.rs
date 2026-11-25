@@ -11,6 +11,7 @@ pub mod chops;
 pub mod dsp;
 mod dialog;
 mod drag;
+pub mod key;
 pub mod library;
 mod editor;
 pub mod loops;
@@ -237,8 +238,18 @@ pub struct Shared {
     pads_sig: Mutex<String>,
     to_audio_pads: Mutex<rtrb::Producer<Arc<PadSet>>>,
     pad_garbage: Mutex<rtrb::Consumer<Arc<PadSet>>>,
-    /// `song_view.chops` index of the tile a pad is playing, or -1.
-    pub pad_playing: std::sync::atomic::AtomicI64,
+    /// Bit i set: the chop tile with `song_view.chops` index i has its pad
+    /// held (tiles past 63 don't light up).
+    pub pads_down: AtomicU64,
+    /// Saved with the Live set (the same Arc as the persisted param field).
+    pub session: Arc<Mutex<SessionState>>,
+    /// A chop to re-select once the restored song has been analysed.
+    restore_chop: Mutex<Option<(String, usize, usize)>>,
+    /// Gain that plays the selected sample at a matched loudness (1.0 if
+    /// unknown). Previews only; exports are untouched.
+    pub preview_gain: AtomicF32,
+    /// The host's sample rate (0 until known); renders are converted to it.
+    pub host_rate: std::sync::atomic::AtomicU32,
     /// Chop length (bars) shown in the chop grid. Kept here so it survives
     /// closing the window.
     pub chop_length: AtomicUsize,
@@ -296,7 +307,13 @@ impl Shared {
         let length = self.chop_length.load(Ordering::Relaxed);
         let view = self.song_view.lock().unwrap().clone().filter(|v| v.key == selection.key);
         let sig = match &view {
-            Some(v) if tempo > 0.0 => format!("{}|{}|{length}|{tempo}|{}", v.key, v.bpm, selection.stem_mask),
+            Some(v) if tempo > 0.0 => format!(
+                "{}|{}|{length}|{tempo}|{}|{}",
+                v.key,
+                v.bpm,
+                selection.stem_mask,
+                self.host_rate.load(Ordering::Relaxed)
+            ),
             _ => "current".to_string(),
         };
         {
@@ -311,11 +328,11 @@ impl Shared {
             let _ = self.to_audio_pads.lock().unwrap().push(Arc::new(set));
         };
         let Some(view) = view.filter(|_| tempo > 0.0) else {
-            send(PadSet { clips: Vec::new(), chop_indices: Vec::new(), play_current: true });
+            send(PadSet { clips: Vec::new(), chop_indices: Vec::new(), play_current: true, gain: 1.0 });
             return;
         };
         // Silence the old song's pads at once, then render this one's.
-        send(PadSet { clips: Vec::new(), chop_indices: Vec::new(), play_current: false });
+        send(PadSet { clips: Vec::new(), chop_indices: Vec::new(), play_current: false, gain: 1.0 });
         let shared = self.clone();
         std::thread::Builder::new()
             .name("tempo-sampler-pads".into())
@@ -330,7 +347,7 @@ impl Shared {
                     let mut sel = selection.clone();
                     sel.chop = Some(ChopSel { index: i, number, chop: chop.clone() });
                     let asset = shared.make_asset(&sel, &src).ok()?;
-                    let mut r = asset.stretch_to(tempo);
+                    let mut r = shared.at_host_rate(asset.stretch_to(tempo));
                     r.span = Some((chop.start as f32 / total, chop.end as f32 / total));
                     Some((i, Arc::new(r)))
                 });
@@ -343,14 +360,128 @@ impl Shared {
                     .to_audio_pads
                     .lock()
                     .unwrap()
-                    .push(Arc::new(PadSet { clips, chop_indices, play_current: false }));
+                    .push(Arc::new(PadSet {
+                        clips,
+                        chop_indices,
+                        play_current: false,
+                        gain: shared.loudness_gain(&selection.key),
+                    }));
             })
             .ok();
+    }
+
+    /// Brings the plugin in line with its parameters, the way the same
+    /// clicks in the GUI would. Does nothing for values already in effect,
+    /// so the GUI (which sets both) and the host can't fight.
+    pub fn apply_params(self: &Arc<Self>, stem_mask: u8, chop_length: usize, tempo_scale: f32) {
+        let mut rerender = false;
+        // Stems (at least one stays on). Applied to the selection once its
+        // stems are ready; until then the switches wait.
+        if stem_mask != 0 && self.stem_switches.swap(stem_mask, Ordering::Relaxed) != stem_mask {
+            let mut sel = self.selection.lock().unwrap();
+            if self.stems_for(&sel.key).is_some() && sel.stem_mask != stem_mask {
+                sel.stem_mask = stem_mask;
+                rerender = true;
+            }
+        }
+        if self.chop_length.swap(chop_length, Ordering::Relaxed) != chop_length {
+            self.refresh_pads();
+            self.save_session();
+        }
+        // ½× / 1× / 2× for the selected file (saved per file, as in the GUI).
+        let key = self.selection.lock().unwrap().key.clone();
+        if let Some(entry) = self.library.entry(&key) {
+            if let (Some(base), true) = (entry.base_bpm, entry.scale != tempo_scale) {
+                self.library.set_scale(&key, tempo_scale);
+                let mut sel = self.selection.lock().unwrap();
+                if sel.key == key {
+                    sel.bpm = base * tempo_scale;
+                    sel.chop = None; // chops belong to the old tempo's analysis
+                    rerender = true;
+                }
+            }
+        }
+        if rerender {
+            self.render_now();
+        }
+    }
+
+    /// The gain that plays `key` at the common preview loudness.
+    fn loudness_gain(&self, key: &str) -> f32 {
+        self.library.entry(key).and_then(|e| e.loudness).map_or(1.0, key::matching_gain)
+    }
+
+    /// Converts a render to the host's sample rate (high-quality windowed
+    /// sinc), so the audio thread plays it sample for sample instead of
+    /// interpolating, which would alias.
+    fn at_host_rate(&self, mut r: RenderedLoop) -> RenderedLoop {
+        let host = self.host_rate.load(Ordering::Relaxed);
+        if host > 0 && host != r.sample_rate {
+            r.samples = dsp::resample_stereo(&r.samples, r.sample_rate, host);
+            r.sample_rate = host;
+        }
+        r
     }
 
     /// Marks the current selection as the clip the audio thread should play
     /// (not from the audio thread: it locks the selection).
     pub fn want_selection(&self) {
+        let key = self.selection.lock().unwrap().render_key();
+        self.wanted_key.store(loops::key_hash(&key), Ordering::Relaxed);
+        self.save_session();
+    }
+
+    /// Copies what's selected into the state saved with the Live set.
+    pub fn save_session(&self) {
+        let sel = self.selection.lock().unwrap().clone();
+        let analysed = self.song_view.lock().unwrap().as_ref().is_some_and(|v| v.key == sel.key);
+        let mut session = self.session.lock().unwrap();
+        let is_song = analysed || (session.is_song && session.key == sel.key);
+        *session = SessionState {
+            is_song,
+            chop: sel.chop.as_ref().map(|c| (c.chop.start, c.chop.end)),
+            key: sel.key,
+            path: sel.path,
+            name: sel.name,
+            bpm: sel.bpm,
+            chop_length: self.chop_length.load(Ordering::Relaxed),
+            stem_switches: self.stem_switches.load(Ordering::Relaxed),
+        };
+    }
+
+    /// Puts back what the Live set saved (called when the plugin starts;
+    /// the audio thread then renders it once it knows the tempo, and the
+    /// chop comes back after the song is analysed).
+    fn restore_session(self: &Arc<Self>) {
+        let saved = self.session.lock().unwrap().clone();
+        if saved.key.is_empty() || saved.bpm <= 0.0 {
+            return;
+        }
+        if saved.path.as_ref().is_some_and(|p| !p.exists()) {
+            return; // the file has moved since
+        }
+        if saved.chop_length > 0 {
+            self.chop_length.store(saved.chop_length, Ordering::Relaxed);
+        }
+        if saved.stem_switches != 0 {
+            self.stem_switches.store(saved.stem_switches, Ordering::Relaxed);
+        }
+        *self.selection.lock().unwrap() = Selection {
+            key: saved.key.clone(),
+            path: saved.path.clone(),
+            name: saved.name.clone(),
+            bpm: saved.bpm,
+            chop: None,
+            stem_mask: ALL_STEMS,
+        };
+        if let Some((start, end)) = saved.chop {
+            *self.restore_chop.lock().unwrap() = Some((saved.key.clone(), start, end));
+        }
+        if saved.is_song {
+            if let Some(path) = &saved.path {
+                self.request_stems(&saved.key, path); // from the cache if split before
+            }
+        }
         let key = self.selection.lock().unwrap().render_key();
         self.wanted_key.store(loops::key_hash(&key), Ordering::Relaxed);
     }
@@ -382,6 +513,7 @@ impl Shared {
         while self.garbage.lock().unwrap().pop().is_ok() {}
 
         let selection = self.selection.lock().unwrap().clone();
+        self.preview_gain.store(self.loudness_gain(&selection.key), Ordering::Relaxed);
         let asset = match self.load(&selection) {
             Ok(asset) => asset,
             Err(e) => {
@@ -407,14 +539,15 @@ impl Shared {
                     let current = || shared.latest_request.load(Ordering::Relaxed) == id;
                     let start_frames = (START_RENDER_SECS * asset.sample_rate as f32) as usize;
                     if current() && asset.frames() > start_frames * 2 {
-                        let mut start = asset.stretch_start(bpm, start_frames);
+                        let mut start = shared.at_host_rate(asset.stretch_start(bpm, start_frames));
                         let part = start_frames as f32 / asset.frames() as f32;
                         start.span = span.map(|(a, b)| (a, a + (b - a) * part));
                         shared.publish(id, bpm, start);
                     }
                     // Gives up between pieces once a newer request exists, so
                     // flicking through songs doesn't pile up stretches.
-                    if let Some(mut rendered) = asset.stretch_to_cancellable(bpm, &|| !current()) {
+                    if let Some(rendered) = asset.stretch_to_cancellable(bpm, &|| !current()) {
+                        let mut rendered = shared.at_host_rate(rendered);
                         rendered.span = span;
                         shared.publish(id, bpm, rendered);
                     }
@@ -431,7 +564,7 @@ impl Shared {
                     .ok();
             }
         } else {
-            let mut rendered = asset.stretch_to(bpm);
+            let mut rendered = self.at_host_rate(asset.stretch_to(bpm));
             rendered.span = span;
             self.publish(id, bpm, rendered);
         }
@@ -601,6 +734,22 @@ impl Shared {
             chops: analysis.chops,
             chop_overviews,
         }));
+        // A chop saved with the Live set: select it again now its tiles exist.
+        let restore = self.restore_chop.lock().unwrap().take();
+        if let Some((key, start, end)) = restore.filter(|(k, _, _)| *k == selection.key) {
+            let view = self.song_view.lock().unwrap().clone();
+            if let Some(view) = view {
+                if let Some(index) = view.chops.iter().position(|c| c.start == start && c.end == end) {
+                    let chop = view.chops[index].clone();
+                    let bars = chop.bars;
+                    let number = view.chops[..index].iter().filter(|c| c.bars == bars).count() + 1;
+                    let mut sel = self.selection.lock().unwrap();
+                    if sel.key == key {
+                        sel.chop = Some(ChopSel { index, number, chop });
+                    }
+                }
+            }
+        }
         self.song_view_version.fetch_add(1, Ordering::Relaxed);
         {
             let mut running = self.analysing.lock().unwrap();
@@ -609,6 +758,7 @@ impl Shared {
             }
         }
         self.refresh_pads(); // chops are known now
+        self.save_session(); // now known to be a song (and maybe its chop)
     }
 
     /// The selected song's stems, if they're ready.
@@ -801,7 +951,7 @@ impl Shared {
             }
         };
         let asset = self.make_asset(selection, &src)?;
-        self.write_export(Arc::new(asset.stretch_to(bpm)))
+        self.write_export(Arc::new(self.at_host_rate(asset.stretch_to(bpm))))
     }
 
     /// Writes a render to the export folder. Song renders can be tens of
@@ -819,6 +969,22 @@ impl Shared {
     }
 }
 
+/// What's saved in the Live set and restored when it reopens: the selected
+/// file, its chop, the bar length shown and the stem switches.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct SessionState {
+    pub key: String,
+    pub path: Option<PathBuf>,
+    pub name: String,
+    pub bpm: f32,
+    pub is_song: bool,
+    /// The selected chop by its frames in the song (stable across loads:
+    /// the analysis is deterministic).
+    pub chop: Option<(usize, usize)>,
+    pub chop_length: usize,
+    pub stem_switches: u8,
+}
+
 /// Clips for MIDI pads, rendered ahead so a pad plays at once.
 pub struct PadSet {
     /// Chop tiles of the shown length, in tile order: note 36 + k plays
@@ -829,6 +995,8 @@ pub struct PadSet {
     pub chop_indices: Vec<usize>,
     /// Not a song: any pad plays whatever is selected.
     pub play_current: bool,
+    /// Loudness-matching gain for these clips (see `Shared::preview_gain`).
+    pub gain: f32,
 }
 
 /// First pad note (C1 in Live / most pad controllers).
@@ -836,6 +1004,8 @@ const FIRST_PAD_NOTE: u8 = 36;
 
 pub enum Task {
     Render { id: u64, bpm: f32 },
+    /// Parameters changed (automation, MIDI mapping or the GUI): apply them.
+    ApplyParams { stem_mask: u8, chop_length: usize, tempo_scale: f32 },
 }
 
 pub struct TempoSampler {
@@ -865,18 +1035,141 @@ pub struct TempoSampler {
     from_pads: rtrb::Consumer<Arc<PadSet>>,
     to_pad_garbage: rtrb::Producer<Arc<PadSet>>,
     pads: Option<Arc<PadSet>>,
-    /// The clip a pad is playing: (note, clip, its chop index or -1).
-    pad_voice: Option<(u8, Arc<RenderedLoop>, i64)>,
-    pad_pos: f64,
-    pad_level: f32,
-    pad_held: bool,
+    voices: [Option<Voice>; MAX_VOICES],
+    /// Slot of the most recent hit, for the playhead.
+    last_voice: usize,
+    /// The Live set's saved state has been applied.
+    restored: bool,
+    /// Parameter values last handed to `apply_params`.
+    applied_params: (u8, usize, f32),
 }
 
 #[derive(Params)]
 pub struct TempoSamplerParams {
     /// Window size, saved with the Ableton set.
     #[persist = "editor-state"]
-    editor_state: Arc<ViziaState>,
+    pub editor_state: Arc<ViziaState>,
+
+    /// The selection etc., saved with the set (see `SessionState`).
+    #[persist = "session"]
+    session: Arc<Mutex<SessionState>>,
+
+    /// Mono: a new pad cuts off the one playing (like a choke group).
+    /// Poly: pads overlap, up to `MAX_VOICES`.
+    #[id = "pad_mode"]
+    pub pad_mode: EnumParam<PadMode>,
+
+    // The controls, as parameters Live can automate and MIDI-map. Changes
+    // from the host are applied by `Shared::apply_params`; the GUI sets
+    // them too, so automation lanes follow clicks.
+    #[id = "drums"]
+    pub drums: BoolParam,
+    #[id = "bass"]
+    pub bass: BoolParam,
+    #[id = "other"]
+    pub other: BoolParam,
+    #[id = "vocals"]
+    pub vocals: BoolParam,
+    #[id = "chop_len"]
+    pub chop_length: EnumParam<ChopLength>,
+    #[id = "tempo_x"]
+    pub tempo_scale: EnumParam<TempoScale>,
+    /// Play previews and pads at a matched loudness (exports unchanged).
+    #[id = "match_loud"]
+    pub match_loudness: BoolParam,
+}
+
+impl TempoSamplerParams {
+    /// Stem switches as a mask (bit i = `stems::STEM_NAMES[i]`).
+    pub fn stem_mask(&self) -> u8 {
+        [&self.drums, &self.bass, &self.other, &self.vocals]
+            .iter()
+            .enumerate()
+            .fold(0, |m, (i, p)| if p.value() { m | 1 << i } else { m })
+    }
+}
+
+#[derive(Enum, Debug, PartialEq, Clone, Copy)]
+pub enum ChopLength {
+    #[name = "1 bar"]
+    One,
+    #[name = "2 bars"]
+    Two,
+    #[name = "4 bars"]
+    Four,
+}
+
+impl ChopLength {
+    pub fn bars(self) -> usize {
+        match self {
+            ChopLength::One => 1,
+            ChopLength::Two => 2,
+            ChopLength::Four => 4,
+        }
+    }
+
+    pub fn from_bars(bars: usize) -> Self {
+        match bars {
+            1 => ChopLength::One,
+            4 => ChopLength::Four,
+            _ => ChopLength::Two,
+        }
+    }
+}
+
+#[derive(Enum, Debug, PartialEq, Clone, Copy)]
+pub enum TempoScale {
+    #[name = "½×"]
+    Half,
+    #[name = "1×"]
+    One,
+    #[name = "2×"]
+    Double,
+}
+
+impl TempoScale {
+    pub fn factor(self) -> f32 {
+        match self {
+            TempoScale::Half => 0.5,
+            TempoScale::One => 1.0,
+            TempoScale::Double => 2.0,
+        }
+    }
+
+    pub fn from_factor(f: f32) -> Self {
+        if f < 0.75 {
+            TempoScale::Half
+        } else if f > 1.5 {
+            TempoScale::Double
+        } else {
+            TempoScale::One
+        }
+    }
+}
+
+#[derive(Enum, Debug, PartialEq, Clone, Copy)]
+pub enum PadMode {
+    #[name = "Mono (choke)"]
+    Mono,
+    #[name = "Poly"]
+    Poly,
+}
+
+/// Pad voices that can sound at once in Poly mode.
+const MAX_VOICES: usize = 8;
+
+/// One pad playing a clip from its start.
+struct Voice {
+    note: u8,
+    clip: Arc<RenderedLoop>,
+    /// `song_view.chops` index of its tile, or -1.
+    chop: i64,
+    pos: f64,
+    /// Smoothed on/off level (fades in on the hit, out on release).
+    level: f32,
+    /// From the note's velocity.
+    gain: f32,
+    held: bool,
 }
 
 impl Default for TempoSampler {
@@ -884,6 +1177,7 @@ impl Default for TempoSampler {
         let (to_audio, from_render) = rtrb::RingBuffer::new(8);
         let (to_garbage, garbage) = rtrb::RingBuffer::new(16);
         let (to_audio_pads, from_pads) = rtrb::RingBuffer::new(4);
+        let session = Arc::new(Mutex::new(SessionState::default()));
         let (to_pad_garbage, pad_garbage) = rtrb::RingBuffer::new(8);
         let shared = Shared {
             transport: HostTransport::default(),
@@ -898,7 +1192,11 @@ impl Default for TempoSampler {
             pads_sig: Mutex::new(String::new()),
             to_audio_pads: Mutex::new(to_audio_pads),
             pad_garbage: Mutex::new(pad_garbage),
-            pad_playing: std::sync::atomic::AtomicI64::new(-1),
+            pads_down: AtomicU64::new(0),
+            host_rate: std::sync::atomic::AtomicU32::new(0),
+            preview_gain: AtomicF32::new(1.0),
+            session: session.clone(),
+            restore_chop: Mutex::new(None),
             playhead: AtomicF32::new(-1.0),
             chop_length: AtomicUsize::new(2),
             stem_switches: AtomicU8::new(ALL_STEMS),
@@ -922,6 +1220,15 @@ impl Default for TempoSampler {
         Self {
             params: Arc::new(TempoSamplerParams {
                 editor_state: editor::default_state(),
+                session,
+                pad_mode: EnumParam::new("Pad mode", PadMode::Mono),
+                drums: BoolParam::new("Drums", true),
+                bass: BoolParam::new("Bass", true),
+                other: BoolParam::new("Other", true),
+                vocals: BoolParam::new("Vocals", true),
+                chop_length: EnumParam::new("Chop length", ChopLength::Two),
+                tempo_scale: EnumParam::new("Tempo", TempoScale::One),
+                match_loudness: BoolParam::new("Match loudness", true),
             }),
             shared: Arc::new(shared),
             from_render,
@@ -939,19 +1246,25 @@ impl Default for TempoSampler {
             from_pads,
             to_pad_garbage,
             pads: None,
-            pad_voice: None,
-            pad_pos: 0.0,
-            pad_level: 0.0,
-            pad_held: false,
+            voices: std::array::from_fn(|_| None),
+            last_voice: 0,
+            restored: false,
+            applied_params: (ALL_STEMS, 2, 1.0),
         }
     }
 }
 
 impl TempoSampler {
-    /// A pad was hit: start its clip from the top (replacing any pad that's
-    /// playing). Song pads play their chop tile; otherwise the current clip.
-    fn pad_on(&mut self, note: u8) {
-        let (clip, index) = match self.pads.as_deref() {
+    fn param_values(&self) -> (u8, usize, f32) {
+        let p = &self.params;
+        (p.stem_mask(), p.chop_length.value().bars(), p.tempo_scale.value().factor())
+    }
+
+    /// A pad was hit: start its clip from the top at `velocity` (0..1).
+    /// Song pads play their chop tile; otherwise the current clip. In Mono
+    /// mode the pads already playing are released (choked).
+    fn pad_on(&mut self, note: u8, velocity: f32) {
+        let (clip, chop) = match self.pads.as_deref() {
             Some(set) if !set.play_current => {
                 let k = note.checked_sub(FIRST_PAD_NOTE).map(usize::from);
                 match k.and_then(|k| Some((set.clips.get(k)?.clone(), set.chop_indices[k] as i64))) {
@@ -964,13 +1277,55 @@ impl TempoSampler {
                 None => return,
             },
         };
-        if let Some((_, old, _)) = self.pad_voice.replace((note, clip, index)) {
-            let _ = self.to_garbage.push(old);
+        if self.params.pad_mode.value() == PadMode::Mono {
+            for v in self.voices.iter_mut().flatten() {
+                v.held = false;
+            }
         }
-        self.pad_pos = 0.0;
-        self.pad_level = 0.0;
-        self.pad_held = true;
-        self.shared.pad_playing.store(index, Ordering::Relaxed);
+        // A free slot, else the quietest voice (released ones first).
+        let slot = self.voices.iter().position(|v| v.is_none()).unwrap_or_else(|| {
+            (0..MAX_VOICES)
+                .min_by(|&a, &b| {
+                    let key = |i: usize| self.voices[i].as_ref().map_or((false, 0.0), |v| (v.held, v.level));
+                    let (ka, kb) = (key(a), key(b));
+                    (ka.0, ka.1).partial_cmp(&(kb.0, kb.1)).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0)
+        });
+        let loudness = if !self.params.match_loudness.value() {
+            1.0
+        } else if chop >= 0 {
+            self.pads.as_deref().map_or(1.0, |set| set.gain)
+        } else {
+            self.shared.preview_gain.load(Ordering::Relaxed)
+        };
+        let voice = Voice { note, clip, chop, pos: 0.0, level: 0.0, gain: velocity.clamp(0.0, 1.0) * loudness, held: true };
+        if let Some(old) = self.voices[slot].replace(voice) {
+            let _ = self.to_garbage.push(old.clip); // freed off the audio thread
+        }
+        self.last_voice = slot;
+        self.publish_pads_down();
+    }
+
+    /// A pad was released: its voices fade out.
+    fn pad_off(&mut self, note: u8) {
+        for v in self.voices.iter_mut().flatten() {
+            if v.note == note {
+                v.held = false;
+            }
+        }
+        self.publish_pads_down();
+    }
+
+    /// Tells the GUI which tiles have their pad held.
+    fn publish_pads_down(&self) {
+        let mask = self
+            .voices
+            .iter()
+            .flatten()
+            .filter(|v| v.held && (0..64).contains(&v.chop))
+            .fold(0u64, |m, v| m | 1 << v.chop);
+        self.shared.pads_down.store(mask, Ordering::Relaxed);
     }
 }
 
@@ -1002,6 +1357,9 @@ impl Plugin for TempoSampler {
         let shared = self.shared.clone();
         Box::new(move |task| match task {
             Task::Render { id, bpm } => shared.render(id, bpm),
+            Task::ApplyParams { stem_mask, chop_length, tempo_scale } => {
+                shared.apply_params(stem_mask, chop_length, tempo_scale)
+            }
         })
     }
 
@@ -1009,6 +1367,7 @@ impl Plugin for TempoSampler {
         editor::create(
             self.shared.clone(),
             async_executor,
+            self.params.clone(),
             self.params.editor_state.clone(),
         )
     }
@@ -1021,6 +1380,21 @@ impl Plugin for TempoSampler {
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate;
         self.preview_fade_coef = 1.0 - (-1.0 / (PREVIEW_FADE_SECS * self.sample_rate)).exp();
+        // Renders are made at the host's rate: if that changed, re-render
+        // (the audio thread asks once it sees a tempo).
+        let rate = self.sample_rate.round() as u32;
+        if self.shared.host_rate.swap(rate, Ordering::Relaxed) != rate {
+            self.requested_bpm = 0.0;
+        }
+        // The Live set's saved state has been loaded by now: put it back (the
+        // first time only; later initializes are sample-rate changes etc.).
+        if !self.restored {
+            self.restored = true;
+            self.shared.restore_session();
+        }
+        // Parameter values as loaded are what's in effect (the session state
+        // saved with them agrees); only later changes need applying.
+        self.applied_params = self.param_values();
         true
     }
 
@@ -1041,16 +1415,29 @@ impl Plugin for TempoSampler {
                 let _ = self.to_pad_garbage.push(old); // freed off the audio thread
             }
         }
+        // Notes are applied at their exact sample in step 4b. A fixed-size
+        // list: no allocation on the audio thread (extra notes are dropped).
+        let mut notes = [(0u32, 0u8, 0.0f32, false); 128];
+        let mut note_count = 0;
         while let Some(event) = context.next_event() {
-            match event {
-                NoteEvent::NoteOn { note, .. } => self.pad_on(note),
-                NoteEvent::NoteOff { note, .. } => {
-                    if self.pad_voice.as_ref().is_some_and(|v| v.0 == note) {
-                        self.pad_held = false;
-                    }
-                }
-                _ => {}
+            let note = match event {
+                NoteEvent::NoteOn { timing, note, velocity, .. } => (timing, note, velocity, true),
+                NoteEvent::NoteOff { timing, note, .. } => (timing, note, 0.0, false),
+                _ => continue,
+            };
+            if note_count < notes.len() {
+                notes[note_count] = note;
+                note_count += 1;
             }
+        }
+
+        // Parameters changed (automation, MIDI mapping, the GUI): apply them
+        // off the audio thread.
+        let values = self.param_values();
+        if values != self.applied_params {
+            self.applied_params = values;
+            let (stem_mask, chop_length, tempo_scale) = values;
+            context.execute_background(Task::ApplyParams { stem_mask, chop_length, tempo_scale });
         }
 
         let t = context.transport();
@@ -1129,6 +1516,8 @@ impl Plugin for TempoSampler {
             self.preview_level = 0.0; // fade in once it arrives
         }
 
+        let preview_gain =
+            if self.params.match_loudness.value() { shared.preview_gain.load(Ordering::Relaxed) } else { 1.0 };
         for mut frame in buffer.iter_samples() {
             if !ready {
                 break;
@@ -1147,8 +1536,9 @@ impl Plugin for TempoSampler {
             let i0 = (pos as usize).min(frames - 1);
             let i1 = (i0 + 1) % frames;
             let frac = (pos - i0 as f64) as f32;
-            // Unity gain: level is set on the track the clip lands on.
-            let level = self.preview_level;
+            // Unity gain, or loudness-matched: the level of what lands in the
+            // set is up to the track.
+            let level = self.preview_level * preview_gain;
             for ch in 0..2 {
                 let s = lp.samples[i0 * 2 + ch] * (1.0 - frac) + lp.samples[i1 * 2 + ch] * frac;
                 if let Some(o) = frame.get_mut(ch) {
@@ -1157,45 +1547,58 @@ impl Plugin for TempoSampler {
             }
         }
 
-        // 4b. The pad voice: plays from its start while the pad is held,
-        // fades out when released.
-        let mut pad_done = false;
-        if let Some(clip) = self.pad_voice.as_ref().map(|v| v.1.clone()) {
-            let frames = clip.frames();
-            let step = clip.sample_rate as f64 / self.sample_rate as f64;
-            for mut frame in buffer.iter_samples() {
-                let target = if self.pad_held { 1.0 } else { 0.0 };
-                self.pad_level += (target - self.pad_level) * self.preview_fade_coef;
-                if frames == 0 || (!self.pad_held && self.pad_level < 1e-4) {
-                    pad_done = true;
-                    break;
+        // 4b. Pad voices: each plays its clip from the start while its pad
+        // is held and fades out on release. Notes start on their own sample.
+        let mut next_note = 0;
+        for (i, mut frame) in buffer.iter_samples().enumerate() {
+            while next_note < note_count && notes[next_note].0 as usize <= i {
+                let (_, note, velocity, on) = notes[next_note];
+                if on {
+                    self.pad_on(note, velocity);
+                } else {
+                    self.pad_off(note);
                 }
-                let pos = self.pad_pos;
-                self.pad_pos = (pos + step) % frames as f64;
+                next_note += 1;
+            }
+            let coef = self.preview_fade_coef;
+            for slot in 0..MAX_VOICES {
+                let Some(v) = self.voices[slot].as_mut() else { continue };
+                let target = if v.held { 1.0 } else { 0.0 };
+                v.level += (target - v.level) * coef;
+                let frames = v.clip.frames();
+                if frames == 0 || (!v.held && v.level < 1e-4) {
+                    if let Some(done) = self.voices[slot].take() {
+                        let _ = self.to_garbage.push(done.clip);
+                    }
+                    continue;
+                }
+                let pos = v.pos;
+                v.pos = (pos + v.clip.sample_rate as f64 / self.sample_rate as f64) % frames as f64;
                 let i0 = (pos as usize).min(frames - 1);
                 let i1 = (i0 + 1) % frames;
                 let frac = (pos - i0 as f64) as f32;
+                let g = v.level * v.gain;
                 for ch in 0..2 {
-                    let s = clip.samples[i0 * 2 + ch] * (1.0 - frac) + clip.samples[i1 * 2 + ch] * frac;
+                    let s = v.clip.samples[i0 * 2 + ch] * (1.0 - frac) + v.clip.samples[i1 * 2 + ch] * frac;
                     if let Some(o) = frame.get_mut(ch) {
-                        *o += s * self.pad_level;
+                        *o += s * g;
                     }
                 }
             }
         }
-        if pad_done {
-            if let Some((_, old, _)) = self.pad_voice.take() {
-                let _ = self.to_garbage.push(old);
-            }
-            self.shared.pad_playing.store(-1, Ordering::Relaxed);
+        // Notes past the end of the block (shouldn't happen) still count.
+        while next_note < note_count {
+            let (_, note, velocity, on) = notes[next_note];
+            if on { self.pad_on(note, velocity) } else { self.pad_off(note) }
+            next_note += 1;
         }
         let shared = &self.shared;
 
-        // 5. Report where the preview is within the selected song (a pad's
-        // clip first).
-        if let Some((_, clip, _)) = self.pad_voice.as_ref() {
-            if let (Some((a, b)), true) = (clip.span, clip.frames() > 0) {
-                let p = a + (self.pad_pos / clip.frames() as f64) as f32 * (b - a);
+        // 5. Report where the preview is within the selected song (the
+        // latest pad's clip first).
+        if let Some(v) = self.voices[self.last_voice].as_ref() {
+            if let (Some((a, b)), true) = (v.clip.span, v.clip.frames() > 0) {
+                let p = a + (v.pos / v.clip.frames() as f64) as f32 * (b - a);
                 shared.playhead.store(p, Ordering::Relaxed);
                 return ProcessStatus::Normal;
             }
@@ -1398,14 +1801,94 @@ mod tests {
 
         // Note 36 plays the first tile from the top; 35 does nothing.
         plugin.pads = Some(set.clone());
-        plugin.pad_on(35);
-        assert!(plugin.pad_voice.is_none());
-        plugin.pad_on(36);
-        let (note, clip, index) = plugin.pad_voice.as_ref().unwrap();
-        assert_eq!((*note, *index), (36, tiles[0] as i64));
-        assert!(Arc::ptr_eq(clip, &set.clips[0]));
-        assert_eq!(plugin.pad_pos, 0.0);
-        assert_eq!(shared.pad_playing.load(Ordering::Relaxed), tiles[0] as i64);
+        plugin.pad_on(35, 1.0);
+        assert!(plugin.voices.iter().all(|v| v.is_none()));
+        plugin.pad_on(36, 0.5);
+        let v = plugin.voices[plugin.last_voice].as_ref().unwrap();
+        assert_eq!((v.note, v.chop, v.pos, v.gain), (36, tiles[0] as i64, 0.0, 0.5));
+        assert!(Arc::ptr_eq(&v.clip, &set.clips[0]));
+        assert_eq!(shared.pads_down.load(Ordering::Relaxed), 1 << tiles[0]);
+
+        // Mono (the default): the next pad chokes the first. Poly: both play.
+        plugin.pad_on(37, 1.0);
+        assert_eq!(plugin.voices.iter().flatten().filter(|v| v.held).count(), 1);
+        assert_eq!(shared.pads_down.load(Ordering::Relaxed), 1 << tiles[1]);
+        plugin.pad_off(37);
+        assert_eq!(shared.pads_down.load(Ordering::Relaxed), 0);
+        assert!(plugin.voices.iter().flatten().all(|v| !v.held), "released voices fade out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a Live set saves comes back when it's reopened: the song, its
+    /// chop (after analysis), the bar length and the stem switches.
+    #[test]
+    fn session_saved_with_the_set_is_restored() {
+        let looped = LoopAsset::test_loop().stretch_to(97.0).samples;
+        let mut samples = vec![0.0f32; 2 * 24_000];
+        while samples.len() < 2 * 48_000 * 40 {
+            samples.extend_from_slice(&looped);
+        }
+        let dir = std::env::temp_dir().join(format!("tempo-sampler-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("song.wav");
+        let spec = hound::WavSpec { channels: 2, sample_rate: 48_000, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        samples.iter().for_each(|s| w.write_sample(*s).unwrap());
+        w.finalize().unwrap();
+        let wait_view = |shared: &Shared| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while shared.song_view.lock().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "not analysed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Session 1: pick the song, its third chop, 4 bars, drums off.
+        let first = TempoSampler::default();
+        let shared = first.shared.clone();
+        *shared.selection.lock().unwrap() = Selection {
+            key: path.to_string_lossy().into(),
+            path: Some(path.clone()),
+            name: "song".into(),
+            bpm: 97.0,
+            chop: None,
+            stem_mask: ALL_STEMS,
+        };
+        let id = shared.next_request();
+        shared.render(id, 120.0);
+        wait_view(&shared);
+        let view = shared.song_view.lock().unwrap().clone().unwrap();
+        let chop = view.chops[2].clone();
+        shared.selection.lock().unwrap().chop = Some(ChopSel { index: 2, number: 3, chop: chop.clone() });
+        shared.chop_length.store(4, Ordering::Relaxed);
+        shared.stem_switches.store(0b1110, Ordering::Relaxed);
+        shared.want_selection();
+        // What Live stores: the persisted field, serialised.
+        let saved = serde_json::to_string(&*first.params.session.lock().unwrap()).unwrap();
+
+        // Session 2: a fresh plugin given that state, then initialized.
+        let second = TempoSampler::default();
+        let mut state: SessionState = serde_json::from_str(&saved).unwrap();
+        assert!(state.is_song);
+        // Don't start a stem split here: it would share the GPU with the
+        // stems test running alongside (the plugin only ever runs one).
+        state.is_song = false;
+        *second.params.session.lock().unwrap() = state;
+        let shared2 = second.shared.clone();
+        shared2.restore_session();
+        assert_eq!(shared2.selection.lock().unwrap().key, path.to_string_lossy());
+        assert_eq!(shared2.chop_length.load(Ordering::Relaxed), 4);
+        assert_eq!(shared2.stem_switches.load(Ordering::Relaxed), 0b1110);
+        let id = shared2.next_request();
+        shared2.render(id, 120.0);
+        wait_view(&shared2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared2.selection.lock().unwrap().chop.is_none() {
+            assert!(Instant::now() < deadline, "chop not restored");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let restored = shared2.selection.lock().unwrap().chop.clone().unwrap();
+        assert_eq!((restored.index, restored.chop.start, restored.chop.end), (2, chop.start, chop.end));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

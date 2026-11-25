@@ -198,6 +198,26 @@ press-drag.row:over .fade-left {
 press-drag.row:checked .fade-left {
   background-image: linear-gradient(to left, #26262600, #262626);
 }
+/* Starred samples: a small star before the details line. */
+press-drag.row .row-star {
+  size: 12px;
+  font-size: 11;
+  color: #f5c451;
+  top: 1s;
+  bottom: 1s;
+}
+/* The Favourites filter, while on. */
+.nav-item:checked {
+  background-color: #262626;
+}
+.nav-item:checked icon {
+  color: #f5c451;
+}
+/* The star beside the title, once starred. */
+button.icon-button.starred icon {
+  color: #e0a800;
+}
+
 press-drag.row.muted .name,
 press-drag.row.muted .meta {
   color: #5a5a5a;

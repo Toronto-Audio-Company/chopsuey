@@ -104,7 +104,71 @@ pub fn resample_stereo(x: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || x.is_empty() {
         return x.to_vec();
     }
-    const PHASES: usize = 2048;
+    let ratio = to as f64 / from as f64;
+    let (half, table) = sinc_table(from, to);
+    let taps = 2 * half as usize;
+
+    let n_in = (x.len() / 2) as isize;
+    let n_out = ((x.len() / 2) as f64 * ratio).round() as usize;
+    let mut out = vec![0.0f32; n_out * 2];
+    // Outputs are independent: split them across cores. Away from the ends
+    // every tap is in range, so the inner loop needs no bounds checks (same
+    // arithmetic in the same order either way, so the same result).
+    let fill = |first: usize, out: &mut [f32]| {
+        for (k, o) in out.chunks_exact_mut(2).enumerate() {
+            let n = first + k;
+            let t = n as f64 / ratio;
+            let base = t.floor() as isize;
+            let p = (((t - base as f64) * PHASES as f64) as usize).min(PHASES - 1);
+            let row = &table[p * taps..(p + 1) * taps];
+            let start = base - half + 1;
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            if start >= 0 && start + taps as isize <= n_in {
+                let src = &x[2 * start as usize..2 * (start as usize + taps)];
+                for (s, &w) in src.chunks_exact(2).zip(row) {
+                    l += s[0] * w;
+                    r += s[1] * w;
+                }
+            } else {
+                for (j, &w) in row.iter().enumerate() {
+                    let k = start + j as isize;
+                    if k >= 0 && k < n_in {
+                        l += x[2 * k as usize] * w;
+                        r += x[2 * k as usize + 1] * w;
+                    }
+                }
+            }
+            o[0] = l;
+            o[1] = r;
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(12);
+    if threads <= 1 || n_out < 50_000 {
+        fill(0, &mut out);
+    } else {
+        let chunk = n_out.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (c, part) in out.chunks_mut(chunk * 2).enumerate() {
+                let fill = &fill;
+                scope.spawn(move || fill(c * chunk, part));
+            }
+        });
+    }
+    out
+}
+
+const PHASES: usize = 2048;
+
+/// The polyphase filter for `from` → `to` Hz: (half-width in taps, table of
+/// `PHASES` rows × `2 * half` weights). Built once per rate pair.
+fn sinc_table(from: u32, to: u32) -> (isize, std::sync::Arc<Vec<f32>>) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static TABLES: OnceLock<Mutex<HashMap<(u32, u32), (isize, Arc<Vec<f32>>)>>> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(t) = tables.lock().unwrap().get(&(from, to)) {
+        return t.clone();
+    }
     let ratio = to as f64 / from as f64;
     let fc = ratio.min(1.0) * 0.95; // cutoff, relative to the input Nyquist
     let half = (32.0 / ratio.min(1.0)).ceil() as isize;
@@ -134,28 +198,9 @@ pub fn resample_stereo(x: &[f32], from: u32, to: u32) -> Vec<f32> {
             table[p * taps + j] = (v / sum) as f32;
         }
     }
-
-    let n_in = (x.len() / 2) as isize;
-    let n_out = ((x.len() / 2) as f64 * ratio).round() as usize;
-    let mut out = vec![0.0f32; n_out * 2];
-    for n in 0..n_out {
-        let t = n as f64 / ratio;
-        let base = t.floor() as isize;
-        let p = (((t - base as f64) * PHASES as f64) as usize).min(PHASES - 1);
-        let row = &table[p * taps..(p + 1) * taps];
-        let start = base - half + 1;
-        let (mut l, mut r) = (0.0f32, 0.0f32);
-        for (j, &w) in row.iter().enumerate() {
-            let k = start + j as isize;
-            if k >= 0 && k < n_in {
-                l += x[2 * k as usize] * w;
-                r += x[2 * k as usize + 1] * w;
-            }
-        }
-        out[2 * n] = l;
-        out[2 * n + 1] = r;
-    }
-    out
+    let entry = (half, Arc::new(table));
+    tables.lock().unwrap().insert((from, to), entry.clone());
+    entry
 }
 
 #[cfg(test)]

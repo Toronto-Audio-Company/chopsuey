@@ -2,7 +2,7 @@ use nih_plug::prelude::{AsyncExecutor, Editor, GuiContext, ParentWindowHandle};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::icons::{
     ICON_ADJUSTMENTS_ALT, ICON_FOLDER, ICON_FOLDERS, ICON_FOLDER_OPEN, ICON_FOLDER_PLUS,
-    ICON_REPEAT, ICON_SEARCH, ICON_CUT, ICON_WAVE_SINE, ICON_X,
+    ICON_REPEAT, ICON_STAR_FILLED, ICON_SEARCH, ICON_CUT, ICON_WAVE_SINE, ICON_X,
 };
 use nih_plug_vizia::vizia::vg;
 use nih_plug_vizia::widgets::*;
@@ -15,8 +15,8 @@ use std::sync::Arc;
 use crate::library::{BpmSource, BUILTIN_KEY, MAX_FILE_SECS};
 use crate::stems::STEM_NAMES;
 use crate::{
-    dialog, drag, ChopSel, Selection, Shared, StemState, Task, TempoSampler,
-    ALL_STEMS, SONG_MIN_SECS,
+    dialog, drag, ChopLength, ChopSel, Selection, Shared, StemState, Task, TempoSampler, TempoSamplerParams,
+    TempoScale, ALL_STEMS, SONG_MIN_SECS,
 };
 
 /// The native view (NSView* on macOS) the host opened our editor in.
@@ -34,6 +34,8 @@ const ROW_HEIGHT: f32 = 40.0;
 #[derive(Lens)]
 struct AppData {
     shared: Arc<Shared>,
+    #[lens(ignore)]
+    params: Arc<TempoSamplerParams>,
     #[lens(ignore)]
     executor: AsyncExecutor<TempoSampler>,
     #[lens(ignore)]
@@ -55,6 +57,10 @@ struct AppData {
     selected_is_loop: bool,
     /// The selected sample's ½× / 1× / 2× tempo choice.
     selected_scale: f32,
+    /// The selected sample is starred.
+    selected_favourite: bool,
+    /// The sidebar shows starred samples only.
+    favourites_only: bool,
     /// Folders the user opened or closed (relative to the default: roots
     /// open, subfolders closed).
     #[lens(ignore)]
@@ -65,8 +71,6 @@ struct AppData {
     message: String,
     /// Index of the selected chop, -1 for the whole file.
     selected_chop: i64,
-    /// Chop length (bars) shown in the grid.
-    chop_length: usize,
     /// Whether the last press selected something, so a drag that follows
     /// it exports that (and not a previous selection).
     #[lens(ignore)]
@@ -101,6 +105,8 @@ struct Row {
     /// How far the name scrolls (px) when hovered, to show what's cut off;
     /// 0 when it fits.
     overflow: f32,
+    /// Starred.
+    favourite: bool,
 }
 
 #[derive(Clone)]
@@ -120,6 +126,10 @@ enum AppEvent {
     Rescan,
     /// Press on the loop tile: play the selection (and allow a drag).
     Audition,
+    /// Star / un-star the selected sample.
+    ToggleFavourite,
+    /// Show only starred samples in the sidebar (or everything again).
+    ToggleFavouritesOnly,
     /// The mouse was let go: previews play only while held.
     StopPreview,
     /// The mouse entered / left sidebar row n (for the name marquee).
@@ -134,8 +144,20 @@ impl AppData {
     fn rebuild_rows(&mut self) {
         let needle = self.search.trim().to_lowercase();
         let st = self.shared.library.state.lock().unwrap();
+        // Search: every word must match the name, folder or key ("am",
+        // "f#m"); "90-100" keeps tempos in that range. The Favourites
+        // filter keeps starred samples only.
+        let words: Vec<&str> = needle.split_whitespace().collect();
+        let fav_only = self.favourites_only;
         let matches = |e: &crate::library::Entry| {
-            needle.is_empty() || e.name.to_lowercase().contains(&needle) || e.folder.to_lowercase().contains(&needle)
+            if fav_only && !e.favourite {
+                return false;
+            }
+            let key = e.musical_key.as_deref().unwrap_or("").to_lowercase();
+            words.iter().all(|w| match tempo_range(w) {
+                Some((lo, hi)) => e.bpm.is_some_and(|b| b >= lo && b <= hi),
+                None => e.name.to_lowercase().contains(w) || e.folder.to_lowercase().contains(w) || key == *w,
+            })
         };
         let sample_row = |e: &crate::library::Entry, depth: usize| Row {
             key: e.key.clone(),
@@ -146,16 +168,19 @@ impl AppData {
             name: e.name.clone(),
             meta: match (e.source, e.bpm) {
                 (BpmSource::Pending, _) => "Detecting tempo…".into(),
-                (_, Some(b)) => format!(
-                    "{} BPM · {}",
-                    format_bpm(b),
-                    match e.beats() {
+                (_, Some(b)) => {
+                    let length = match e.beats() {
                         Some(beats) if e.is_loop() => format_bars(beats),
                         _ => format_duration(e.secs),
+                    };
+                    match &e.musical_key {
+                        Some(k) => format!("{} BPM · {k} · {length}", format_bpm(b)),
+                        None => format!("{} BPM · {length}", format_bpm(b)),
                     }
-                ),
+                }
                 (_, None) => "No tempo found".into(),
             },
+            favourite: e.favourite,
             folder: e.folder.clone(),
             bpm: e.bpm.map(format_bpm).unwrap_or_else(|| "—".into()),
             bars: match e.beats() {
@@ -234,6 +259,7 @@ impl AppData {
                 usable: true,
                 selected: false,
                 overflow: 0.0,
+                favourite: false,
             });
             if !open {
                 return;
@@ -268,7 +294,11 @@ impl AppData {
                 Some(b) if e.is_loop() => format_bars(b),
                 _ => format_duration(e.secs),
             };
-            self.selected_meta = format!("{tempo} · {length}");
+            self.selected_meta = match &e.musical_key {
+                Some(k) => format!("{tempo} · {k} · {length}"),
+                None => format!("{tempo} · {length}"),
+            };
+            self.selected_favourite = e.favourite;
             self.selected_is_song = !e.is_loop() && e.secs >= SONG_MIN_SECS;
             self.selected_is_loop = e.is_loop();
             self.selected_scale = e.scale;
@@ -324,7 +354,7 @@ impl AppData {
 
 
 impl Model for AppData {
-    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
         event.map(|e, _| match e {
             AppEvent::ToggleStem(i) => {
                 let key = self.shared.selection.lock().unwrap().key.clone();
@@ -341,11 +371,15 @@ impl Model for AppData {
                 self.shared.selection.lock().unwrap().stem_mask = switches;
                 self.message.clear();
                 self.request_render();
+                let p = &self.params;
+                let param = [&p.drums, &p.bass, &p.other, &p.vocals][*i];
+                set_param(cx, param, switches & (1 << i) != 0);
             }
             AppEvent::SetChopLength(bars) => {
-                self.chop_length = *bars;
                 self.shared.chop_length.store(*bars, Ordering::Relaxed);
+                set_param(cx, &self.params.chop_length, ChopLength::from_bars(*bars));
                 self.shared.refresh_pads(); // pads play the tiles shown
+                self.shared.save_session();
             }
             AppEvent::SelectChop(index) => {
                 self.press_selected = false;
@@ -420,6 +454,13 @@ impl Model for AppData {
                     if self.press_selected {
                         self.shared.preview.store(true, Ordering::Relaxed);
                     }
+                    // The tempo parameter shows this file's ½× / 1× / 2×.
+                    if let Some(e) = self.shared.library.entry(&key) {
+                        let scale = TempoScale::from_factor(e.scale);
+                        if self.params.tempo_scale.value() != scale {
+                            set_param(cx, &self.params.tempo_scale, scale);
+                        }
+                    }
                 }
             }
             AppEvent::SetTempoScale(scale) => {
@@ -431,6 +472,7 @@ impl Model for AppData {
                 if self.shared.library.entry(&key).is_some_and(|e| e.base_bpm.is_some() && e.scale != *scale) {
                     self.shared.library.set_scale(&key, *scale);
                     self.select_key(&key);
+                    set_param(cx, &self.params.tempo_scale, TempoScale::from_factor(*scale));
                 }
             }
             AppEvent::AddFolder => {
@@ -444,6 +486,15 @@ impl Model for AppData {
             AppEvent::RemoveFolder(index) => self.shared.library.remove_folder(*index),
             AppEvent::ToggleFolders => self.show_folders = !self.show_folders,
             AppEvent::Rescan => self.shared.library.rescan(),
+            AppEvent::ToggleFavourite => {
+                if self.selected_key != BUILTIN_KEY {
+                    self.shared.library.toggle_favourite(&self.selected_key);
+                }
+            }
+            AppEvent::ToggleFavouritesOnly => {
+                self.favourites_only = !self.favourites_only;
+                self.rebuild_rows();
+            }
             AppEvent::StopPreview => {
                 self.shared.preview.store(false, Ordering::Relaxed);
             }
@@ -560,6 +611,7 @@ fn library_summary(s: &Shared) -> String {
 pub(crate) fn create(
     shared: Arc<Shared>,
     executor: AsyncExecutor<TempoSampler>,
+    params: Arc<TempoSamplerParams>,
     editor_state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
     shared.library.ensure_loaded();
@@ -586,6 +638,7 @@ pub(crate) fn create(
         let selected_key = shared.selection.lock().unwrap().key.clone();
         AppData {
             shared: shared.clone(),
+            params: params.clone(),
             executor: executor.clone(),
             parent_view: gui_parent_view.clone(),
             search: String::new(),
@@ -598,6 +651,8 @@ pub(crate) fn create(
             selected_is_song: false,
             selected_is_loop: false,
             selected_scale: 1.0,
+            selected_favourite: false,
+            favourites_only: false,
             // Development: TEMPO_SAMPLER_DEMO_HOVER=<key> starts as if that
             // sidebar row were hovered (to see the marquee in screenshots).
             hover: std::env::var("TEMPO_SAMPLER_DEMO_HOVER")
@@ -606,8 +661,8 @@ pub(crate) fn create(
             toggled_folders: Default::default(),
             sample_count: 0,
             message: String::new(),
-            selected_chop: -1,
-            chop_length: shared.chop_length.load(Ordering::Relaxed),
+            // A chop restored from the Live set shows as selected.
+            selected_chop: shared.selection.lock().unwrap().chop.as_ref().map_or(-1, |c| c.index as i64),
             press_selected: true,
         }
         .build(cx);
@@ -682,6 +737,28 @@ const ICON_GAP: f32 = 8.0;
 const TEXT_LINE: f32 = ICON_COLUMN + ICON_SIZE + ICON_GAP;
 const INDENT: f32 = ICON_SIZE + ICON_GAP;
 const BRAND_MARK: f32 = 24.0;
+
+/// Bar length shown, from the shared value (the GUI, automation or a
+/// restored set can change it).
+fn chop_length_lens() -> impl Lens<Target = usize> {
+    AppData::shared.map(|s| s.chop_length.load(Ordering::Relaxed))
+}
+
+/// A search word like "90-100" (or "90–100"): the tempo range it means.
+fn tempo_range(word: &str) -> Option<(f32, f32)> {
+    let (a, b) = word.split_once(['-', '–'])?;
+    let (a, b): (f32, f32) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+    Some((a.min(b), a.max(b)))
+}
+
+/// Sets a host parameter from the GUI as one gesture, so Live records it
+/// (automation lanes follow clicks).
+fn set_param<P: nih_plug::prelude::Param>(cx: &mut EventContext, param: &P, value: P::Plain) {
+    use nih_plug_vizia::widgets::ParamEvent;
+    cx.emit(ParamEvent::BeginSetParameter(param).upcast());
+    cx.emit(ParamEvent::SetParameter(param, value).upcast());
+    cx.emit(ParamEvent::EndSetParameter(param).upcast());
+}
 
 /// A sidebar row's name, clipped to the row. While the row is hovered, a
 /// name that doesn't fit scrolls to show the rest, car-stereo style.
@@ -863,13 +940,22 @@ fn sidebar(cx: &mut Context) {
                 HStack::new(cx, |cx| {
                     VStack::new(cx, |cx| {
                         marquee_name(cx, row.then(Row::name), index);
-                        Label::new(cx, row.then(Row::meta))
-                            .class("meta")
-                            .width(Stretch(1.0))
-                            .min_width(Pixels(0.0))
-                            .text_wrap(false)
-                            .overflow(Overflow::Hidden)
-                            .hoverable(false);
+                        HStack::new(cx, |cx| {
+                            Icon::new(cx, ICON_STAR_FILLED)
+                                .class("row-star")
+                                .toggle_class("hidden", row.then(Row::favourite).map(|f| !*f))
+                                .hoverable(false);
+                            Label::new(cx, row.then(Row::meta))
+                                .class("meta")
+                                .width(Stretch(1.0))
+                                .min_width(Pixels(0.0))
+                                .text_wrap(false)
+                                .overflow(Overflow::Hidden)
+                                .hoverable(false);
+                        })
+                        .col_between(Pixels(4.0))
+                        .height(Auto)
+                        .hoverable(false);
                     })
                     .child_top(Stretch(1.0))
                     .child_bottom(Stretch(1.0))
@@ -903,6 +989,8 @@ fn sidebar(cx: &mut Context) {
 
         Element::new(cx).height(Pixels(1.0)).background_color(Color::rgb(0x22, 0x22, 0x22));
         VStack::new(cx, |cx| {
+            nav_item(cx, ICON_STAR_FILLED, "Favourites", || AppEvent::ToggleFavouritesOnly)
+                .checked(AppData::favourites_only);
             nav_item(cx, ICON_FOLDER_PLUS, "Add folder", || AppEvent::AddFolder);
             nav_item(
                 cx,
@@ -987,6 +1075,12 @@ fn title_block(cx: &mut Context) {
                 .width(Auto)
                 .max_width(Percentage(92.0));
             show_in_finder(cx);
+            Button::new(cx, |cx| cx.emit(AppEvent::ToggleFavourite), |cx| {
+                Icon::new(cx, AppData::selected_favourite.map(|f| if *f { ICON_STAR_FILLED } else { ICON_STAR }))
+            })
+            .class("icon-button")
+            .toggle_class("starred", AppData::selected_favourite)
+            .top(Pixels(5.0));
         })
         .col_between(Pixels(8.0))
         .child_top(Pixels(0.0))
@@ -1019,6 +1113,9 @@ fn tempo_switch(cx: &mut Context) {
     })
     .class("segmented");
 }
+
+/// Tabler "star" outline (in vizia's bundled icon font, not in its list of names).
+const ICON_STAR: &str = "\u{eb2e}";
 
 /// Tabler "external-link" (in vizia's bundled icon font, not in its list of names).
 const ICON_EXTERNAL_LINK: &str = "\u{ea99}";
@@ -1064,7 +1161,7 @@ fn song_cards(cx: &mut Context) {
             static DEMO_CHOP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if let Some(n) = std::env::var("TEMPO_SAMPLER_DEMO_CHOP").ok().and_then(|n| n.parse::<usize>().ok()) {
                 if !DEMO_CHOP_DONE.swap(true, Ordering::Relaxed) {
-                    let length = AppData::chop_length.get(cx);
+                    let length = chop_length_lens().get(cx);
                     let index = (0..view.chops.len()).filter(|&i| view.chops[i].bars == length).nth(n.saturating_sub(1));
                     if let Some(i) = index {
                         cx.emit(AppEvent::SelectChop(i));
@@ -1155,7 +1252,7 @@ fn chops_card(cx: &mut Context, shared: Arc<Shared>, view: Arc<crate::SongView>)
                 for bars in [2usize, 4, 1] {
                     let label = if bars == 1 { "1 bar".to_string() } else { format!("{bars} bars") };
                     Button::new(cx, move |cx| cx.emit(AppEvent::SetChopLength(bars)), move |cx| Label::new(cx, &label))
-                        .checked(AppData::chop_length.map(move |l| *l == bars));
+                        .checked(chop_length_lens().map(move |l| *l == bars));
                 }
             })
             .class("segmented");
@@ -1171,7 +1268,7 @@ fn chops_card(cx: &mut Context, shared: Arc<Shared>, view: Arc<crate::SongView>)
         .col_between(Pixels(8.0));
 
         // Tiles for the chosen length.
-        Binding::new(cx, AppData::chop_length, move |cx, length| {
+        Binding::new(cx, chop_length_lens(), move |cx, length| {
             let length = length.get(cx);
             let indices: Vec<usize> = (0..view.chops.len()).filter(|&i| view.chops[i].bars == length).collect();
             VStack::new(cx, |cx| {
@@ -1341,7 +1438,7 @@ fn draw_overview(canvas: &mut Canvas, b: BoundingBox, overview: &[(f32, f32)], c
 /// is down. Only then does it look selected.
 fn tile_playing(d: &AppData, index: usize) -> bool {
     (d.selected_chop == index as i64 && d.shared.preview.load(Ordering::Relaxed))
-        || d.shared.pad_playing.load(Ordering::Relaxed) == index as i64
+        || (index < 64 && d.shared.pads_down.load(Ordering::Relaxed) >> index & 1 == 1)
 }
 
 /// 1-based position of chop `index` among chops of the same length.
@@ -1452,7 +1549,7 @@ impl View for ChopWave {
 
         // The chop being held (playing) in the accent colour, others grey.
         let held = (selected == Some(self.index) && self.shared.preview.load(Ordering::Relaxed))
-            || self.shared.pad_playing.load(Ordering::Relaxed) == self.index as i64;
+            || (self.index < 64 && self.shared.pads_down.load(Ordering::Relaxed) >> self.index & 1 == 1);
         let colour = if held {
             vg::Color::rgb(0x1a, 0x1a, 0x1a)
         } else {
