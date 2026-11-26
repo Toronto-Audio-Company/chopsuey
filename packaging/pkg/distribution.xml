@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Installer layout for scripts/release.sh, which fills in the @...@ values. -->
+<installer-gui-script minSpecVersion="2">
+    <title>chopsuey @VERSION@</title>
+    <organization>com.torontoaudiocompany</organization>
+    <product id="com.torontoaudiocompany.chopsuey" version="@VERSION@"/>
+    <options customize="allow" require-scripts="false" rootVolumeOnly="true" hostArchitectures="@HOST_ARCHS@"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="@MIN_MACOS@"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="vst3"/>
+        <line choice="clap"/>
+        <line choice="au"/>
+    </choices-outline>
+    <choice id="vst3" title="VST3" description="chopsuey.vst3 in /Library/Audio/Plug-Ins/VST3 (Ableton Live and most hosts).">
+        <pkg-ref id="com.torontoaudiocompany.chopsuey.vst3"/>
+    </choice>
+    <choice id="clap" title="CLAP" description="chopsuey.clap in /Library/Audio/Plug-Ins/CLAP (Bitwig, Reaper and other CLAP hosts).">
+        <pkg-ref id="com.torontoaudiocompany.chopsuey.clap"/>
+    </choice>
+    <choice id="au" title="Audio Unit" description="chopsuey.component in /Library/Audio/Plug-Ins/Components (Logic, GarageBand).">
+        <pkg-ref id="com.torontoaudiocompany.chopsuey.au"/>
+    </choice>
+    <pkg-ref id="com.torontoaudiocompany.chopsuey.vst3" version="@VERSION@">chopsuey-vst3.pkg</pkg-ref>
+    <pkg-ref id="com.torontoaudiocompany.chopsuey.clap" version="@VERSION@">chopsuey-clap.pkg</pkg-ref>
+    <pkg-ref id="com.torontoaudiocompany.chopsuey.au" version="@VERSION@">chopsuey-au.pkg</pkg-ref>
+</installer-gui-script>

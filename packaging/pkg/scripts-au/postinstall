@@ -1,0 +1,5 @@
+#!/bin/sh
+# Make the Audio Unit registry pick up the new component right away instead
+# of after a reboot or log-out (hosts list stale AUs otherwise).
+killall -9 AudioComponentRegistrar 2>/dev/null || true
+exit 0

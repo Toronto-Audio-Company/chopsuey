@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The same as scripts/common.sh, so tests and bundles share build artifacts.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  # Validators and the VST3 validator build, cached on their own (see below).
+  CHOPSUEY_TOOLS: ${{ github.workspace }}/../chopsuey-tools
+
+jobs:
+  build-validate:
+    name: Test, bundle, validate (macOS arm64)
+    runs-on: macos-15 # Apple Silicon
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          # For the universal build (used once the stems_helper crate exists).
+          rustup target add x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          # ONNX Runtime's prebuilt binaries (~100 MB), downloaded by ort-sys.
+          cache-directories: ~/Library/Caches/ort.pyke.io
+
+      - name: Cache validators
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CHOPSUEY_TOOLS }}
+          key: validators-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/tools.sh') }}
+
+      - name: Tests (no stem model; tests that need it skip themselves)
+        run: |
+          test ! -e models/htdemucs_fp16weights.onnx
+          cargo test --release --workspace --locked
+
+      # Builds the release bundles (universal once stems_helper exists), the
+      # AU, and the rt-checks debug build, then runs pluginval, Steinberg's
+      # VST3 validator, clap-validator and auval. Never downloads the model.
+      - name: Bundle and validate
+        run: |
+          args=()
+          if [ -f stems_helper/Cargo.toml ]; then args+=(--universal); fi
+          scripts/validate.sh "${args[@]}"
+
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-logs
+          path: target/validation/
+          if-no-files-found: ignore
+
+      - name: Upload bundles
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chopsuey-bundles-unsigned
+          path: |
+            target/bundled/chopsuey.vst3
+            target/bundled/chopsuey.clap
+            target/bundled/chopsuey.component
+          retention-days: 7
