@@ -5,7 +5,7 @@ edition = "2021"
 description = "Shows the host tempo and stretches a loop to match it"
 
 [workspace]
-members = ["xtask"]
+members = ["xtask", "stems_helper"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -26,7 +26,6 @@ rtrb = "0.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 rustfft = "6"
-ort = { version = "=2.0.0-rc.13", features = ["coreml", "webgpu"] }
 libc = "0.2"
 symphonia = { version = "0.6", features = ["all"] }
 ttf-parser = "0.19" # measuring sidebar names for the hover marquee

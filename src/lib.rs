@@ -986,21 +986,18 @@ impl Shared {
                     return Ok(Some(cached));
                 }
                 set_state(StemState::Splitting);
-                // Usually already decoded (or being decoded) for playback.
-                let src = shared.decoded(&key, Some(&path), "the song")?;
-                let separated = stems::with_separator(|sep| {
-                    sep.separate(
-                        &src.samples,
-                        src.sample_rate,
-                        |p| shared.stem_progress.store(p, Ordering::Relaxed),
-                        || cancel.load(Ordering::Relaxed),
-                    )
-                })??;
-                if let (Some(st), Some(dir)) = (&separated, &dir) {
-                    // A failed cache write only costs a re-split later.
-                    let _ = stems::save_cached(dir, st);
+                let dir = dir.ok_or("Can't read this file to split it.")?;
+                // In the helper process (see stems.rs), into the cache.
+                let finished = stems::split(
+                    &path,
+                    &dir,
+                    |p| shared.stem_progress.store(p, Ordering::Relaxed),
+                    || cancel.load(Ordering::Relaxed),
+                )?;
+                if !finished {
+                    return Ok(None);
                 }
-                Ok(separated)
+                stems::load_cached(&dir).map(Some).ok_or_else(|| "The stems were split but couldn't be read back.".to_string())
             })();
             match result {
                 Ok(Some(st)) if !cancel.load(Ordering::Relaxed) => {

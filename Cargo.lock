@@ -243,6 +243,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
+name = "assert_no_alloc"
+version = "1.1.2"
+source = "git+https://github.com/robbert-vdh/rust-assert-no-alloc.git?branch=feature%2Fnested-permit-forbid#a6fb4f62b9624715291e320ea5f0f70e73b035cf"
+dependencies = [
+ "backtrace",
+ "log",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2532,6 +2541,7 @@ source = "git+https://github.com/robbert-vdh/nih-plug.git#de421011f41a6d10fc8c7a
 dependencies = [
  "anyhow",
  "anymap3",
+ "assert_no_alloc",
  "atomic_float",
  "atomic_refcell",
  "backtrace",
@@ -4014,6 +4024,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "stems_helper"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "libc",
+ "ort",
+ "tempo_sampler",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "strength_reduce"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4302,7 +4323,6 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit",
  "objc2-foundation",
- "ort",
  "rtrb 0.4.1",
  "rustfft",
  "serde",

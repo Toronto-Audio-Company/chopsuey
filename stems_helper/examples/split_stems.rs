@@ -2,11 +2,12 @@
 //! timing, how the energy divides between stems, and how well the stems sum
 //! back to the original.
 //!
-//! cargo run --release --example split_stems -- <model.onnx> <song.wav> <out-dir> [gpu|cpu|gpu+cpuN|cpuN]
+//! cargo run --release -p stems_helper --example split_stems -- <model.onnx> <song.wav> <out-dir> [gpu|cpu|gpu+cpuN|cpuN]
 
 use std::path::PathBuf;
 use std::time::Instant;
-use tempo_sampler::stems::{Engine, Separator, STEM_NAMES};
+use stems_helper::separator::{Engine, Separator};
+use tempo_sampler::stems::STEM_NAMES;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

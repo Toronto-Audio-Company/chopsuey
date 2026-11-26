@@ -1,0 +1,18 @@
+[package]
+name = "stems_helper"
+version = "0.1.0"
+edition = "2021"
+description = "chopsuey's stem separation, run as its own process"
+
+[[bin]]
+name = "chopsuey-stems"
+path = "src/main.rs"
+
+[dependencies]
+tempo_sampler = { path = ".." }
+ort = { version = "=2.0.0-rc.13", features = ["coreml", "webgpu"] }
+libc = "0.2"
+
+[dev-dependencies]
+hound = "3.5.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

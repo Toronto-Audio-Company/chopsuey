@@ -1,4 +1,11 @@
-//! Stem separation with HTDemucs (4 stems) running on ONNX Runtime.
+//! Stems: the four parts (drums, bass, other, vocals) a song is split into,
+//! their disk cache, and running the split.
+//!
+//! The split itself (HTDemucs on ONNX Runtime) runs in a separate process,
+//! `chopsuey-stems` (the `stems_helper` crate), next to the plugin binary in
+//! the bundle. If ONNX Runtime or the GPU driver crashes, only the helper
+//! dies and the host keeps running; and the model's memory is freed when a
+//! split ends instead of staying in the host for the session.
 //!
 //! The model weights' licence is unclear (possibly research-only), so this
 //! is for personal use; swap the model before distributing the plugin.
@@ -6,10 +13,6 @@
 use crate::safety::LockExt;
 use std::path::Path;
 
-use ort::session::Session;
-use ort::value::Tensor;
-
-use crate::dsp::resample_stereo;
 
 /// Stem order as the model outputs them.
 pub const STEM_NAMES: [&str; 4] = ["drums", "bass", "other", "vocals"];
@@ -22,193 +25,6 @@ pub const SEGMENT: usize = 343_980;
 pub struct Stems {
     pub sample_rate: u32,
     pub stems: [Vec<f32>; 4],
-}
-
-/// Which hardware runs the model.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Engine {
-    /// Run windows on the GPU through ONNX Runtime's WebGPU backend (Metal
-    /// on macOS, fp32). Falls back to CPU if WebGPU can't start.
-    pub gpu: bool,
-    /// Also run windows on the CPU with this many threads, in parallel with
-    /// the GPU (0 = GPU only). The two take windows from one queue.
-    pub cpu_threads: usize,
-}
-
-impl Engine {
-    pub const CPU_ONLY: Engine = Engine { gpu: false, cpu_threads: 6 };
-}
-
-/// One model instance and the device it runs on.
-struct Worker {
-    label: &'static str,
-    session: std::sync::Mutex<Session>,
-}
-
-/// Runs HTDemucs on one or more devices.
-///
-/// Not CoreML: with this model every CoreML configuration that ran on the
-/// GPU produced wrong stems (SNR vs CPU 0–20 dB), and the neural-network
-/// format failed to compile. WebGPU matches the CPU output (75–88 dB SNR).
-pub struct Separator {
-    workers: Vec<Worker>,
-}
-
-fn build_session(model: &Path, threads: usize, gpu: bool) -> Result<Session, String> {
-    let fail = |e: &dyn std::fmt::Display| format!("couldn't load stem model: {e}");
-    let mut builder = Session::builder()
-        .map_err(|e| fail(&e))?
-        .with_intra_threads(threads.max(1))
-        .map_err(|e| fail(&e))?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-        .map_err(|e| fail(&e))?;
-    if gpu {
-        builder = builder
-            .with_execution_providers([ort::ep::WebGPU::default().build().error_on_failure()])
-            .map_err(|e| fail(&e))?;
-    }
-    builder.commit_from_file(model).map_err(|e| fail(&e))
-}
-
-impl Separator {
-    pub fn load(model: &Path, engine: Engine) -> Result<Self, String> {
-        let mut workers = Vec::new();
-        if engine.gpu {
-            match build_session(model, 2, true) {
-                Ok(session) => workers.push(Worker { label: "gpu", session: session.into() }),
-                Err(e) => crate::logln!("chopsuey: WebGPU unavailable, using CPU ({e})"),
-            }
-        }
-        if engine.cpu_threads > 0 || workers.is_empty() {
-            let threads = if engine.cpu_threads > 0 { engine.cpu_threads } else { Self::default_threads() };
-            workers.push(Worker { label: "cpu", session: build_session(model, threads, false)?.into() });
-        }
-        Ok(Self { workers })
-    }
-
-    /// Devices in use, e.g. "gpu+cpu".
-    pub fn devices(&self) -> String {
-        self.workers.iter().map(|w| w.label).collect::<Vec<_>>().join("+")
-    }
-
-    /// CPU threads to use inside a DAW: half the cores, so separation
-    /// doesn't starve the host's audio threads.
-    pub fn default_threads() -> usize {
-        (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).max(2)
-    }
-
-    /// Separates interleaved stereo audio. `progress` gets 0..1; returns
-    /// `Ok(None)` if `cancelled()` became true.
-    pub fn separate(
-        &mut self,
-        stereo: &[f32],
-        sample_rate: u32,
-        mut progress: impl FnMut(f32),
-        cancelled: impl Fn() -> bool + Sync,
-    ) -> Result<Option<Stems>, String> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Mutex;
-
-        let frames_in = stereo.len() / 2;
-        let x = resample_stereo(stereo, sample_rate, MODEL_SAMPLE_RATE);
-        let n = x.len() / 2;
-
-        // Normalise like the Demucs CLI: by the whole track's mono mean/std.
-        let mono_sum: f64 = x.chunks(2).map(|f| (f[0] + f[1]) as f64 * 0.5).sum();
-        let mean = (mono_sum / n.max(1) as f64) as f32;
-        let var = x.chunks(2).map(|f| ((f[0] + f[1]) * 0.5 - mean).powi(2) as f64).sum::<f64>() / n.max(1) as f64;
-        let std = (var.sqrt() as f32).max(1e-8);
-
-        // Overlapping windows (50%), cross-faded with triangular weights.
-        let stride = SEGMENT / 2;
-        let weight: Vec<f32> = (0..SEGMENT).map(|i| (i + 1).min(SEGMENT - i) as f32 / stride as f32).collect();
-        let offsets: Vec<usize> = (0..n.max(1)).step_by(stride).collect();
-        let acc = Mutex::new((vec![vec![0.0f32; n * 2]; 4], vec![0.0f32; n]));
-        let next = AtomicUsize::new(0);
-        let done = AtomicUsize::new(0);
-        let error: Mutex<Option<String>> = Mutex::new(None);
-
-        let run_window = |session: &Mutex<Session>, offset: usize| -> Result<(), String> {
-            let len = SEGMENT.min(n - offset);
-            // Planar [L..., R...], zero-padded to the window.
-            let mut chunk = vec![0.0f32; 2 * SEGMENT];
-            for i in 0..len {
-                chunk[i] = (x[2 * (offset + i)] - mean) / std;
-                chunk[SEGMENT + i] = (x[2 * (offset + i) + 1] - mean) / std;
-            }
-            let input = Tensor::from_array(([1usize, 2, SEGMENT], chunk)).map_err(|e| e.to_string())?;
-            let mut session = session.lock().unwrap_or_else(|e| e.into_inner());
-            let outputs = session.run(ort::inputs![input]).map_err(|e| e.to_string())?;
-            let (_, y) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-            // y: (1, 4, 2, SEGMENT)
-            let mut guard = acc.lock().unwrap_or_else(|e| e.into_inner());
-            let (stems, wsum) = &mut *guard;
-            for s in 0..4 {
-                let (l, r) = (&y[(s * 2) * SEGMENT..], &y[(s * 2 + 1) * SEGMENT..]);
-                let out = &mut stems[s];
-                for i in 0..len {
-                    out[2 * (offset + i)] += weight[i] * l[i];
-                    out[2 * (offset + i) + 1] += weight[i] * r[i];
-                }
-            }
-            for i in 0..len {
-                wsum[offset + i] += weight[i];
-            }
-            Ok(())
-        };
-
-        // Each device takes the next window from the queue until it's empty.
-        std::thread::scope(|scope| {
-            for worker in &self.workers {
-                let (next, done, error, offsets, cancelled, run_window) =
-                    (&next, &done, &error, &offsets, &cancelled, &run_window);
-                scope.spawn(move || loop {
-                    if cancelled() || error.locked().is_some() {
-                        break;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(&offset) = offsets.get(i) else { break };
-                    if let Err(e) = run_window(&worker.session, offset) {
-                        *error.locked() = Some(e);
-                        break;
-                    }
-                    done.fetch_add(1, Ordering::Relaxed);
-                });
-            }
-            // Report progress from this thread while the workers run.
-            loop {
-                let d = done.load(Ordering::Relaxed);
-                progress(d as f32 / offsets.len() as f32);
-                if d >= offsets.len() || cancelled() || error.locked().is_some() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
-        if let Some(e) = error.into_inner().unwrap() {
-            return Err(e);
-        }
-        if cancelled() {
-            return Ok(None);
-        }
-
-        let (acc, wsum) = acc.into_inner().unwrap();
-        let stems: Vec<Vec<f32>> = acc
-            .into_iter()
-            .map(|mut s| {
-                for (i, w) in wsum.iter().enumerate() {
-                    let w = w.max(1e-8);
-                    s[2 * i] = s[2 * i] / w * std + mean / 4.0;
-                    s[2 * i + 1] = s[2 * i + 1] / w * std + mean / 4.0;
-                }
-                let mut back = resample_stereo(&s, MODEL_SAMPLE_RATE, sample_rate);
-                back.resize(frames_in * 2, 0.0);
-                back
-            })
-            .collect();
-        let stems: [Vec<f32>; 4] = stems.try_into().map_err(|_| "stem count".to_string())?;
-        Ok(Some(Stems { sample_rate, stems }))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,23 +64,113 @@ fn own_binary_path() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Engine used inside the plugin (decided by benchmark; see README).
-pub const PLUGIN_ENGINE: Engine = Engine { gpu: true, cpu_threads: 4 };
+/// File name of the helper executable, next to the plugin binary.
+pub const HELPER_FILE: &str = "chopsuey-stems";
 
-/// One separator for the whole process, shared by every plugin instance
-/// (the model needs ~1 GB of RAM while running), loaded on first use.
-static SEPARATOR: std::sync::OnceLock<std::sync::Mutex<Option<Separator>>> = std::sync::OnceLock::new();
-
-/// Runs `f` with the shared separator, loading the model first if needed.
-/// Only one separation runs at a time; other callers wait.
-pub fn with_separator<R>(f: impl FnOnce(&mut Separator) -> R) -> Result<R, String> {
-    let cell = SEPARATOR.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        let path = model_path().ok_or("Stem model not found in the plugin bundle")?;
-        *guard = Some(Separator::load(&path, PLUGIN_ENGINE)?);
+/// The helper: `CHOPSUEY_STEMS_HELPER` if set, else next to this binary (in
+/// the bundle, `Contents/MacOS`), else in the cargo target folder above it
+/// (tests run from `target/<profile>/deps`).
+pub fn helper_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("CHOPSUEY_STEMS_HELPER") {
+        return Some(p.into());
     }
-    Ok(f(guard.as_mut().expect("loaded above")))
+    let binary = own_binary_path()?;
+    binary.ancestors().skip(1).take(2).map(|dir| dir.join(HELPER_FILE)).find(|p| p.is_file())
+}
+
+/// Splits `input` into stems saved in `out` (see `load_cached`), by running
+/// the helper. `progress` gets 0..1. `Ok(false)` if `cancelled()` became
+/// true, which stops the helper at once.
+///
+/// One split runs at a time per host process, however many plugin
+/// instances ask (each needs ~1 GB and the GPU); the others wait their turn.
+pub fn split(input: &Path, out: &Path, mut progress: impl FnMut(f32), cancelled: impl Fn() -> bool) -> Result<bool, String> {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = loop {
+        match ONE_AT_A_TIME.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if cancelled() => return Ok(false),
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let helper = helper_path().ok_or("The stem splitter is missing from the plugin. Reinstall chopsuey.")?;
+    let model = model_path().ok_or("The stem model is missing from the plugin. Reinstall chopsuey.")?;
+    let mut child = Command::new(&helper)
+        .arg("--model")
+        .arg(&model)
+        .arg("--input")
+        .arg(input)
+        .arg("--out")
+        .arg(out)
+        // Kept open: the helper quits when it closes (us going away).
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Couldn't start the stem splitter ({e})."))?;
+
+    // Progress as f32 bits; the last "error" line, for the message.
+    let shared_progress = std::sync::Arc::new(AtomicU32::new(0));
+    let error_line = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let reader = child.stdout.take().map(|stdout| {
+        let (progress, error_line) = (shared_progress.clone(), error_line.clone());
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(p) = line.strip_prefix("progress ").and_then(|p| p.parse::<f32>().ok()) {
+                    progress.store(p.to_bits(), Ordering::Relaxed);
+                } else if let Some(e) = line.strip_prefix("error ") {
+                    *error_line.locked() = Some(e.to_string());
+                } else if let Some(d) = line.strip_prefix("devices ") {
+                    crate::logln!("stems: splitting on {d}");
+                }
+            }
+        })
+    });
+    // ONNX Runtime's own messages go to the log.
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                crate::logln!("stems helper: {line}");
+            }
+        });
+    }
+
+    let status = loop {
+        progress(f32::from_bits(shared_progress.load(Ordering::Relaxed)));
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("Lost track of the stem splitter ({e}).")),
+        }
+    };
+    if let Some(r) = reader {
+        let _ = r.join();
+    }
+    if status.success() {
+        return Ok(true);
+    }
+    use std::os::unix::process::ExitStatusExt;
+    let message = match (error_line.locked().take(), status.signal()) {
+        (Some(e), _) => e,
+        (None, Some(sig)) => {
+            crate::logln!("stems helper killed by signal {sig}");
+            "The stem splitter crashed. Your set is fine; try again, and if it keeps happening send the log (Report a problem).".to_string()
+        }
+        (None, None) => format!("The stem splitter stopped ({status})."),
+    };
+    Err(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -285,12 +191,19 @@ pub const CACHE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Cache folder for a source file, keyed by path, size and modification
 /// time (so an edited file is split again).
 pub fn cache_dir_for(source: &Path) -> Option<std::path::PathBuf> {
-    use std::hash::{Hash, Hasher};
+    use std::os::unix::ffi::OsStrExt;
     let meta = std::fs::metadata(source).ok()?;
     let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (source, meta.len(), modified, MODEL_FILE).hash(&mut h);
-    Some(cache_root().join(format!("{:016x}", h.finish())))
+    // FNV-1a: unlike std's DefaultHasher, the same on every Rust version,
+    // so a toolchain update doesn't orphan everyone's cached stems.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let parts: [&[u8]; 4] = [source.as_os_str().as_bytes(), &meta.len().to_le_bytes(), &modified.to_le_bytes(), MODEL_FILE.as_bytes()];
+    for part in parts {
+        for &b in part.iter().chain(&[0xff]) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    Some(cache_root().join(format!("{h:016x}")))
 }
 
 /// Loads cached stems, or `None` if they aren't all there. The four files
@@ -391,7 +304,8 @@ fn evict(keep: &Path) {
 /// `start..end`, as interleaved stereo.
 pub fn mix(stems: &Stems, mask: u8, start: usize, end: usize) -> Vec<f32> {
     let frames = stems.stems[0].len() / 2;
-    let (start, end) = (start.min(frames), end.min(frames));
+    let start = start.min(frames);
+    let end = end.clamp(start, frames);
     let mut out = vec![0.0f32; (end - start) * 2];
     for (i, s) in stems.stems.iter().enumerate() {
         if mask & (1 << i) != 0 {
@@ -403,62 +317,38 @@ pub fn mix(stems: &Stems, mask: u8, start: usize, end: usize) -> Vec<f32> {
     out
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn model() -> Option<std::path::PathBuf> {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/htdemucs_fp16weights.onnx");
-        p.exists().then_some(p)
+    fn tone(frames: usize, hz: f32) -> Vec<f32> {
+        (0..frames * 2).map(|i| (i as f32 / 2.0 * hz / 48_000.0 * std::f32::consts::TAU).sin() * 0.5).collect()
     }
 
-    /// Needs the model in models/ (it isn't in git); skipped otherwise.
     #[test]
-    fn separates_drum_loop_into_drums() {
-        let Some(path) = model() else {
-            eprintln!("skipping: models/htdemucs_fp16weights.onnx not present");
-            return;
-        };
-        let a = crate::loops::LoopAsset::test_loop();
-        // Two copies so the model sees more than one window.
-        let x: Vec<f32> = a.samples.iter().chain(a.samples.iter()).copied().collect();
-        let mut sep = Separator::load(&path, Engine { gpu: false, cpu_threads: 4 }).unwrap();
-        let st = sep.separate(&x, a.sample_rate, |_| {}, || false).unwrap().unwrap();
-        assert_eq!(st.sample_rate, 48_000);
-        let energy = |v: &[f32]| v.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
-        let e: Vec<f64> = st.stems.iter().map(|s| energy(s)).collect();
-        let total: f64 = e.iter().sum();
-        assert!(e[0] / total > 0.5, "drums share {:.2}", e[0] / total);
-        assert!(e[3] / total < 0.05, "vocals share {:.2}", e[3] / total);
-        for s in &st.stems {
-            assert_eq!(s.len(), x.len());
-        }
-
-        // Cache round trip (16-bit).
+    fn cache_round_trip_and_mix() {
+        let st = Stems { sample_rate: 48_000, stems: [tone(9_000, 100.0), tone(9_000, 200.0), tone(9_000, 300.0), tone(9_000, 400.0)] };
         let dir = std::env::temp_dir().join(format!("tempo-sampler-stems-{}", std::process::id()));
         save_cached(&dir, &st).unwrap();
         let back = load_cached(&dir).unwrap();
         let err = back.stems[0].iter().zip(&st.stems[0]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(err < 1e-3, "cache error {err}");
+        assert!(err < 1e-3, "16-bit cache error {err}");
         let _ = std::fs::remove_dir_all(&dir);
 
-        // The GPU (WebGPU) gives the same stems as the CPU. This is the check
-        // CoreML failed: its GPU stems were off by 0-20 dB SNR.
-        let mut gpu = Separator::load(&path, Engine { gpu: true, cpu_threads: 0 }).unwrap();
-        if gpu.devices() == "gpu" {
-            let g = gpu.separate(&x, a.sample_rate, |_| {}, || false).unwrap().unwrap();
-            for (k, (c, gs)) in st.stems.iter().zip(&g.stems).enumerate() {
-                let err: f64 = c.iter().zip(gs).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
-                let snr = 10.0 * (energy(c) / err.max(1e-20)).log10();
-                assert!(snr > 40.0, "stem {} GPU vs CPU SNR {snr:.1} dB", STEM_NAMES[k]);
-            }
-        } else {
-            eprintln!("WebGPU unavailable here; skipped GPU check");
-        }
+        let both = mix(&st, 0b0011, 0, 9_000);
+        let sum = st.stems[0][10] + st.stems[1][10];
+        assert!((both[10] - sum).abs() < 1e-6);
+    }
 
-        // Mixing all stems gets back (close to) the original.
-        let all = mix(&st, 0b1111, 0, x.len() / 2);
-        let res: f64 = all.iter().zip(&x).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
-        assert!(10.0 * (res / energy(&x)).log10() < -10.0);
+    #[test]
+    fn cache_folder_is_stable() {
+        let file = std::env::temp_dir().join(format!("tempo-sampler-hash-{}", std::process::id()));
+        std::fs::write(&file, b"abc").unwrap();
+        let a = cache_dir_for(&file).unwrap();
+        assert_eq!(a, cache_dir_for(&file).unwrap());
+        std::fs::write(&file, b"abcd").unwrap();
+        assert_ne!(a, cache_dir_for(&file).unwrap(), "an edited file is split again");
+        let _ = std::fs::remove_file(&file);
     }
 }
