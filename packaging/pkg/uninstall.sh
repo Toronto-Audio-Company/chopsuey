@@ -8,8 +8,9 @@
 set -eu
 
 PLUGINS="/Library/Audio/Plug-Ins"
+SUPPORT_PARENT="/Library/Application Support/Toronto Audio Company"
 BUNDLES="$PLUGINS/VST3/chopsuey.vst3 $PLUGINS/CLAP/chopsuey.clap $PLUGINS/Components/chopsuey.component"
-RECEIPTS="com.torontoaudiocompany.chopsuey.vst3 com.torontoaudiocompany.chopsuey.clap com.torontoaudiocompany.chopsuey.au"
+RECEIPTS="com.torontoaudiocompany.chopsuey.vst3 com.torontoaudiocompany.chopsuey.clap com.torontoaudiocompany.chopsuey.au com.torontoaudiocompany.chopsuey.stems"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Removing chopsuey needs administrator rights."
@@ -24,6 +25,12 @@ for b in $BUNDLES; do
     found=1
   fi
 done
+if [ -e "$SUPPORT_PARENT/chopsuey" ]; then
+  rm -rf "$SUPPORT_PARENT/chopsuey"
+  rmdir "$SUPPORT_PARENT" 2>/dev/null || true
+  echo "Removed $SUPPORT_PARENT/chopsuey"
+  found=1
+fi
 for r in $RECEIPTS; do
   pkgutil --pkg-info "$r" >/dev/null 2>&1 && pkgutil --forget "$r" >/dev/null && found=1
 done

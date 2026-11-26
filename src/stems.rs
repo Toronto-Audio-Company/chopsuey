@@ -34,15 +34,21 @@ pub struct Stems {
 /// File name of the model inside the plugin bundle's `Contents/Resources`.
 pub const MODEL_FILE: &str = "htdemucs.onnx";
 
-/// The model: `TEMPO_SAMPLER_MODEL` if set (tests, development), otherwise
-/// `Contents/Resources/htdemucs.onnx` inside the plugin bundle.
+/// Where the installer puts the stem splitter (helper, Dawn and model) once
+/// for every format, instead of a copy inside each plugin bundle.
+pub const SUPPORT_DIR: &str = "/Library/Application Support/Toronto Audio Company/chopsuey";
+
+/// The model: `TEMPO_SAMPLER_MODEL` if set (tests, development), else
+/// `Contents/Resources/htdemucs.onnx` inside the plugin bundle (development
+/// bundles), else the installer's support folder.
 pub fn model_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("TEMPO_SAMPLER_MODEL") {
         return Some(p.into());
     }
-    let binary = own_binary_path()?; // .../chopsuey.vst3/Contents/MacOS/chopsuey
-    let path = binary.parent()?.parent()?.join("Resources").join(MODEL_FILE);
-    path.exists().then_some(path)
+    let in_bundle = own_binary_path() // .../chopsuey.vst3/Contents/MacOS/chopsuey
+        .and_then(|b| Some(b.parent()?.parent()?.join("Resources").join(MODEL_FILE)));
+    let installed = Path::new(SUPPORT_DIR).join(MODEL_FILE);
+    in_bundle.into_iter().chain([installed]).find(|p| p.is_file())
 }
 
 /// Path of the dylib this code lives in (not the host's executable).
@@ -67,15 +73,19 @@ fn own_binary_path() -> Option<std::path::PathBuf> {
 /// File name of the helper executable, next to the plugin binary.
 pub const HELPER_FILE: &str = "chopsuey-stems";
 
-/// The helper: `CHOPSUEY_STEMS_HELPER` if set, else next to this binary (in
-/// the bundle, `Contents/MacOS`), else in the cargo target folder above it
-/// (tests run from `target/<profile>/deps`).
+/// The helper: `CHOPSUEY_STEMS_HELPER` if set, else next to this binary (a
+/// development bundle's `Contents/MacOS`), else the installer's support
+/// folder, else the cargo target folder above this binary (tests run from
+/// `target/<profile>/deps`).
 pub fn helper_path() -> Option<std::path::PathBuf> {
     if let Some(p) = std::env::var_os("CHOPSUEY_STEMS_HELPER") {
         return Some(p.into());
     }
     let binary = own_binary_path()?;
-    binary.ancestors().skip(1).take(2).map(|dir| dir.join(HELPER_FILE)).find(|p| p.is_file())
+    let beside = binary.parent().map(|dir| dir.join(HELPER_FILE));
+    let installed = Path::new(SUPPORT_DIR).join(HELPER_FILE);
+    let target = binary.ancestors().nth(2).map(|dir| dir.join(HELPER_FILE));
+    beside.into_iter().chain([installed]).chain(target).find(|p| p.is_file())
 }
 
 /// Splits `input` into stems saved in `out` (see `load_cached`), by running
@@ -100,6 +110,11 @@ pub fn split(input: &Path, out: &Path, mut progress: impl FnMut(f32), cancelled:
         }
     };
 
+    // ONNX Runtime has no Intel Mac build, so the helper is arm64 only. (An
+    // Intel build of the plugin under Rosetta still starts it natively.)
+    if !apple_silicon() {
+        return Err("Splitting into stems needs a Mac with Apple silicon.".into());
+    }
     let helper = helper_path().ok_or("The stem splitter is missing from the plugin. Reinstall chopsuey.")?;
     let model = model_path().ok_or("The stem model is missing from the plugin. Reinstall chopsuey.")?;
     let mut child = Command::new(&helper)
@@ -171,6 +186,17 @@ pub fn split(input: &Path, out: &Path, mut progress: impl FnMut(f32), cancelled:
         (None, None) => format!("The stem splitter stopped ({status})."),
     };
     Err(message)
+}
+
+/// The hardware is Apple silicon, whatever architecture this code runs as.
+fn apple_silicon() -> bool {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a fixed C string name and an int-sized out buffer.
+    let found = unsafe {
+        libc::sysctlbyname(c"hw.optional.arm64".as_ptr(), (&mut value as *mut libc::c_int).cast(), &mut size, std::ptr::null_mut(), 0)
+    };
+    found == 0 && value == 1
 }
 
 // ---------------------------------------------------------------------------
@@ -342,13 +368,20 @@ mod tests {
     }
 
     #[test]
+    fn knows_the_hardware() {
+        assert_eq!(apple_silicon(), cfg!(target_arch = "aarch64") || std::process::Command::new("sysctl").args(["-n", "hw.optional.arm64"]).output().is_ok_and(|o| o.stdout.starts_with(b"1")));
+    }
+
+    #[test]
     fn cache_folder_is_stable() {
         let file = std::env::temp_dir().join(format!("tempo-sampler-hash-{}", std::process::id()));
         std::fs::write(&file, b"abc").unwrap();
-        let a = cache_dir_for(&file).unwrap();
-        assert_eq!(a, cache_dir_for(&file).unwrap());
+        // Folder names only: another test points the cache root elsewhere.
+        let name = |f: &Path| cache_dir_for(f).unwrap().file_name().unwrap().to_owned();
+        let a = name(&file);
+        assert_eq!(a, name(&file));
         std::fs::write(&file, b"abcd").unwrap();
-        assert_ne!(a, cache_dir_for(&file).unwrap(), "an edited file is split again");
+        assert_ne!(a, name(&file), "an edited file is split again");
         let _ = std::fs::remove_file(&file);
     }
 }

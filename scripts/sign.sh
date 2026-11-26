@@ -3,7 +3,10 @@
 # AU) first, then loose dylibs (Dawn), then executables (the stem helper),
 # then the bundle itself. No --deep: Apple advises against it for signing.
 #
-#   scripts/sign.sh <bundle>...
+#   scripts/sign.sh <bundle or folder>...
+#
+# A plain folder (the installer's stem splitter) has its Mach-O files signed,
+# libraries before executables.
 #
 # With DEVELOPER_ID_APP set (e.g. "Developer ID Application: Name (TEAMID)")
 # everything gets that identity, the hardened runtime and a secure timestamp,
@@ -64,8 +67,23 @@ sign_bundle() {
   codesign --verify --strict --deep "$bundle"
 }
 
-(( $# )) || die "usage: scripts/sign.sh <bundle>..."
+sign_loose() {
+  local dir="$1" f pass
+  for pass in dylib exe; do
+    while IFS= read -r -d '' f; do
+      is_macho "$f" || continue
+      case "$pass:$(file -b "$f")" in
+        dylib:*dynamically\ linked\ shared\ library*) "${SIGN[@]}" "$f" ;;
+        exe:*executable*) "${SIGN[@]}" "$f" ;;
+      esac
+    done < <(find "$dir" -type f -print0)
+  done
+}
+
+(( $# )) || die "usage: scripts/sign.sh <bundle or folder>..."
 if [[ -z "$IDENTITY" ]]; then
   echo "Signing ad hoc (set DEVELOPER_ID_APP to sign for distribution)" >&2
 fi
-for b in "$@"; do sign_bundle "${b%/}"; done
+for b in "$@"; do
+  if [[ -d "${b%/}/Contents" ]]; then sign_bundle "${b%/}"; else sign_loose "${b%/}"; fi
+done

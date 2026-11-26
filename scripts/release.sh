@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Builds the release installer: target/dist/chopsuey-<version>.pkg, which
 # installs the VST3, CLAP and AU to /Library/Audio/Plug-Ins/{VST3,CLAP,
-# Components}, plus target/dist/uninstall-chopsuey.sh to ship alongside.
+# Components} and the stem splitter (helper, Dawn, model) once to
+# /Library/Application Support/Toronto Audio Company/chopsuey (see
+# SUPPORT_DIR in src/stems.rs), plus target/dist/uninstall-chopsuey.sh.
 #
 #   scripts/release.sh [--native]
 #
@@ -29,6 +31,8 @@ INSTALLER_ID="${DEVELOPER_ID_INSTALLER:-}"
 NOTARY="${NOTARY_PROFILE:-}"
 DIST="$TARGET_DIR/dist"
 STAGE="$TARGET_DIR/pkg-stage"
+SUPPORT_STAGE="$TARGET_DIR/pkg-support"
+SUPPORT_PARENT="/Library/Application Support/Toronto Audio Company"
 PKG="$DIST/$NAME-$VERSION.pkg"
 
 if [[ -z "$APP_ID" ]]; then
@@ -50,11 +54,24 @@ fetch_model
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$ROOT=chopsuey"
 
 if (( UNIVERSAL )); then scripts/bundle.sh --universal; else scripts/bundle.sh; fi
+
+# The stem splitter installs once, shared by every format, instead of a
+# copy (about 230 MB with the model) inside each bundle. Taken out before
+# the AU is built, since the AU embeds the CLAP.
+step "Moving the stem splitter out of the bundles"
+rm -rf "$SUPPORT_STAGE" && mkdir -p "$SUPPORT_STAGE/$NAME"
+V="$BUNDLED/$NAME.vst3/Contents"
+mv "$V/MacOS/chopsuey-stems" "$SUPPORT_STAGE/$NAME/"
+find "$V/MacOS" -name '*.dylib' -exec mv {} "$SUPPORT_STAGE/$NAME/" \;
+mv "$V/Resources/htdemucs.onnx" "$SUPPORT_STAGE/$NAME/"
+C="$BUNDLED/$NAME.clap/Contents"
+rm -f "$C/MacOS/chopsuey-stems" "$C"/MacOS/*.dylib "$C/Resources/htdemucs.onnx"
+
 packaging/au/build.sh
 
 step "Signing"
 BUNDLES=("$BUNDLED/$NAME.vst3" "$BUNDLED/$NAME.clap" "$BUNDLED/$NAME.component")
-scripts/sign.sh "${BUNDLES[@]}"
+scripts/sign.sh "$SUPPORT_STAGE/$NAME" "${BUNDLES[@]}"
 if [[ -n "$APP_ID" ]]; then
   for b in "${BUNDLES[@]}"; do
     info="$(codesign --display --verbose=2 "$b" 2>&1)"
@@ -83,8 +100,10 @@ component_pkg() { # <bundle> <install dir> <id suffix> [scripts dir]
 component_pkg "$BUNDLED/$NAME.vst3" /Library/Audio/Plug-Ins/VST3 vst3
 component_pkg "$BUNDLED/$NAME.clap" /Library/Audio/Plug-Ins/CLAP clap
 component_pkg "$BUNDLED/$NAME.component" /Library/Audio/Plug-Ins/Components au "$ROOT/packaging/pkg/scripts-au"
+pkgbuild --root "$SUPPORT_STAGE" --identifier "$PKG_ID.stems" --version "$VERSION" \
+  --install-location "$SUPPORT_PARENT" "$STAGE/$NAME-stems.pkg" >/dev/null
 
-MIN_OS="$(bundle_min_macos "${BUNDLES[@]}")"
+MIN_OS="$(bundle_min_macos "${BUNDLES[@]}" "$SUPPORT_STAGE")"
 HOST_ARCHS="$(lipo -archs "$BUNDLED/$NAME.vst3/Contents/MacOS/$NAME" | tr ' ' ',')"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@MIN_MACOS@/$MIN_OS/g" -e "s/@HOST_ARCHS@/$HOST_ARCHS/g" \
   packaging/pkg/distribution.xml > "$STAGE/distribution.xml"

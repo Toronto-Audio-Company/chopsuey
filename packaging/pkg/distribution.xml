@@ -15,6 +15,7 @@
         <line choice="vst3"/>
         <line choice="clap"/>
         <line choice="au"/>
+        <line choice="stems"/>
     </choices-outline>
     <choice id="vst3" title="VST3" description="chopsuey.vst3 in /Library/Audio/Plug-Ins/VST3 (Ableton Live and most hosts).">
         <pkg-ref id="com.torontoaudiocompany.chopsuey.vst3"/>
@@ -25,6 +26,11 @@
     <choice id="au" title="Audio Unit" description="chopsuey.component in /Library/Audio/Plug-Ins/Components (Logic, GarageBand).">
         <pkg-ref id="com.torontoaudiocompany.chopsuey.au"/>
     </choice>
+    <!-- Shared by every format, so always installed (not shown under Customize). -->
+    <choice id="stems" title="Stem splitter" visible="false" description="The stem splitter and its model, in /Library/Application Support/Toronto Audio Company/chopsuey.">
+        <pkg-ref id="com.torontoaudiocompany.chopsuey.stems"/>
+    </choice>
+    <pkg-ref id="com.torontoaudiocompany.chopsuey.stems" version="@VERSION@">chopsuey-stems.pkg</pkg-ref>
     <pkg-ref id="com.torontoaudiocompany.chopsuey.vst3" version="@VERSION@">chopsuey-vst3.pkg</pkg-ref>
     <pkg-ref id="com.torontoaudiocompany.chopsuey.clap" version="@VERSION@">chopsuey-clap.pkg</pkg-ref>
     <pkg-ref id="com.torontoaudiocompany.chopsuey.au" version="@VERSION@">chopsuey-au.pkg</pkg-ref>

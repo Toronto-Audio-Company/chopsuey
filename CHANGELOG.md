@@ -15,6 +15,8 @@
 - Several chopsuey instances, and several hosts, no longer overwrite each other's favourites and folders. A damaged settings file is kept to one side instead of being replaced with empty settings.
 - Sets record a format version, and saved chops still come back after chop detection improves.
 - Fixed a crash while finding one-shots in some songs.
+- The installer is now 178 MB instead of 466 MB. The stem splitter is installed once for every format instead of inside each one.
+- On Intel Macs, stem splitting says it needs Apple silicon instead of failing.
 
 ### Changed
 - The vendor is now Toronto Audio Company. Sets made with earlier builds still find the plugin in VST3 hosts. CLAP hosts list it as a new plugin.

@@ -10,7 +10,13 @@ Everything that has to be true before a build goes to anyone else, then the step
 | Production licence keypair | `PUBLIC_KEY` in `src/licence.rs` | It is the development key, whose private half sits in `tools/licence_keygen/dev-private-key.txt`. Make a new pair with `cargo run -p licence_keygen -- new-keypair --out <somewhere outside the repo>`, paste the printed public key, and keep the private key in a password manager. |
 | Vendor URL and email | `URL` and `EMAIL` in `src/lib.rs`; `CLAP_MANUAL_URL` and `CLAP_SUPPORT_URL` | Hosts show them, and users need somewhere to get help. |
 | Release repository | `LATEST_RELEASE_API` in `src/update.rs` | The update check reads this repo's latest GitHub release, so the repo must be public, or point it at another one. |
+| nih-plug's CLAP state handling | nih-plug `src/wrapper/clap/wrapper.rs`, `ext_state_load` | A corrupt saved CLAP or AU state makes it try to allocate whatever length the file claims, which crashes the host (clap-validator `state-invalid-random`). After loading state it also never asks the host to rescan parameter values (`state-reproducibility-*`). Both fixes are a few lines. Carry them in a fork via `[patch]` until they're upstream. |
 | Developer ID certificates | `DEVELOPER_ID_APP`, `DEVELOPER_ID_INSTALLER`, `NOTARY_PROFILE` (see `scripts/release.sh`) | Without them macOS blocks the installer on other Macs. |
+
+Decided, written down so they're not a surprise:
+- **Minimum macOS is 13.4.** That's what ONNX Runtime and Dawn are built for. The plugin itself would load on 11, but stem splitting wouldn't.
+- **Stem splitting needs Apple silicon.** ONNX Runtime ships no Intel Mac build. On Intel Macs the plugin works and says stems are unavailable.
+- **The stem splitter is installed once** to `/Library/Application Support/Toronto Audio Company/chopsuey`: the helper, Dawn and the model. It isn't in every bundle. Check that a sandboxed AU host (Logic, GarageBand) can start it, as part of the host pass.
 
 Never change these after the first release. Hosts use them to find the plugin in saved sets:
 - VST3 class ID `TempoSamplerV001`

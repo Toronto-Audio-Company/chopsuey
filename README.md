@@ -2,6 +2,8 @@
 
 A VST3 instrument (Rust, nih-plug + vizia), formerly "Tempo Sampler", that reads Ableton's tempo, stretches loops to match it, previews them in sync, and lets you drag the stretched WAV straight into Ableton.
 
+For users: [docs/MANUAL.md](docs/MANUAL.md). Before a release: [docs/RELEASE.md](docs/RELEASE.md) and [docs/host-testing.md](docs/host-testing.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+
 ## Build and install (macOS)
 
 One command downloads the stem separation model (166 MB, first time only), runs the tests, builds the plugin and installs it where Ableton looks for VST3s:
