@@ -1267,6 +1267,9 @@ pub struct TempoSamplerParams {
     /// could quit without offering to save it.
     #[id = "picked"]
     pub picked: BoolParam,
+    /// Loop previews follow the host's beat position while it plays.
+    #[id = "sync"]
+    pub sync_preview: BoolParam,
 }
 
 /// "+3", "-12", "0": how Ableton shows Transpose and Detune.
@@ -1445,6 +1448,7 @@ impl Default for TempoSampler {
                     .with_unit(" ct")
                     .with_value_to_string(Arc::new(signed)),
                 picked: BoolParam::new("Sample pick", false),
+                sync_preview: BoolParam::new("Sync preview", true),
             }),
             shared: Arc::new(shared),
             from_render,
@@ -1777,6 +1781,21 @@ impl TempoSampler {
             self.preview_level = 0.0; // fade in once it arrives
         }
 
+        // 4a. While the host plays, a loop's preview follows the host's beat
+        // position (like a clip launched in Live), so it's in time with the
+        // set from the first note. It re-locks only if it's off by more than
+        // 10 ms: at the press, or after the host jumps (a loop brace, a
+        // click in the arrangement). Stopped, it free-runs from the top.
+        if ready && t.playing && self.params.sync_preview.value() {
+            if let (Some(beats_now), Some(lp)) = (t.pos_beats(), self.playing_loop.as_deref()) {
+                if lp.is_loop && !lp.one_shot {
+                    if let Some(pos) = synced_position(beats_now, lp.beats as f64, lp.frames(), self.play_pos, lp.sample_rate) {
+                        self.play_pos = pos;
+                    }
+                }
+            }
+        }
+
         let preview_gain =
             if self.params.match_loudness.value() { shared.preview_gain.load(Ordering::Relaxed) } else { 1.0 };
         for mut frame in buffer.iter_samples() {
@@ -1886,6 +1905,19 @@ impl TempoSampler {
     }
 }
 
+/// Where a loop of `loop_beats` beats and `frames` frames should be when
+/// the host is at `host_beats`, if that's more than 10 ms from `current`
+/// (measured around the loop, so the wrap point isn't a jump).
+fn synced_position(host_beats: f64, loop_beats: f64, frames: usize, current: f64, sample_rate: u32) -> Option<f64> {
+    if loop_beats <= 0.0 || frames == 0 {
+        return None;
+    }
+    let frames = frames as f64;
+    let target = host_beats.rem_euclid(loop_beats) / loop_beats * frames;
+    let off = (target - current + frames * 1.5).rem_euclid(frames) - frames * 0.5;
+    (off.abs() > 0.010 * sample_rate as f64).then_some(target)
+}
+
 impl ClapPlugin for TempoSampler {
     // Hosts identify the plugin by this: never change it after release.
     const CLAP_ID: &'static str = "com.torontoaudiocompany.chopsuey";
@@ -1915,6 +1947,19 @@ nih_export_vst3!(TempoSampler);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_follows_host_beats() {
+        // A 4-beat loop of 48 000 frames: 12 000 frames a beat.
+        let at = |beats, current| synced_position(beats, 4.0, 48_000, current, 48_000);
+        assert_eq!(at(0.0, 0.0), None, "already in place");
+        assert_eq!(at(1.0, 0.0), Some(12_000.0), "pressed on beat 2: starts a beat in");
+        assert_eq!(at(9.5, 0.0), Some(18_000.0), "bar 3, beat 2.5");
+        assert_eq!(at(1.0, 12_100.0), None, "within 10 ms: left alone");
+        assert_eq!(at(0.001, 47_990.0), None, "across the wrap is close, not a jump");
+        assert_eq!(at(-1.0, 0.0), Some(36_000.0), "count-in before bar 1");
+        assert_eq!(at(1.0, 0.0).is_some(), synced_position(1.0, 0.0, 48_000, 0.0, 48_000).is_none());
+    }
 
     /// Sets saved before the session had a version still load.
     #[test]
