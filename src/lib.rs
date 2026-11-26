@@ -23,6 +23,7 @@ pub mod loops;
 pub mod one_shots;
 pub mod safety;
 pub mod stems;
+pub mod update;
 
 use library::Library;
 use loops::{LoopAsset, Pitch, RenderedLoop};
