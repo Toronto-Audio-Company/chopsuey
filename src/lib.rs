@@ -13,6 +13,7 @@ mod dialog;
 mod drag;
 pub mod key;
 pub mod library;
+pub mod licence;
 mod editor;
 mod logo;
 pub mod loops;

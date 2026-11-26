@@ -5,7 +5,7 @@ edition = "2021"
 description = "Shows the host tempo and stretches a loop to match it"
 
 [workspace]
-members = ["xtask"]
+members = ["xtask", "licence_format", "tools/licence_keygen"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -24,6 +24,7 @@ ort = { version = "=2.0.0-rc.13", features = ["coreml", "webgpu"] }
 libc = "0.2"
 symphonia = { version = "0.6", features = ["all"] }
 ttf-parser = "0.19" # measuring sidebar names for the hover marquee
+licence_format = { path = "licence_format" } # signed licence keys (src/licence.rs)
 
 [profile.release]
 lto = "thin"
