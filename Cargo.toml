@@ -5,7 +5,7 @@ edition = "2021"
 description = "Shows the host tempo and stretches a loop to match it"
 
 [workspace]
-members = ["xtask", "stems_helper"]
+members = ["xtask", "stems_helper", "licence_format", "tools/licence_keygen"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -29,6 +29,7 @@ rustfft = "6"
 libc = "0.2"
 symphonia = { version = "0.6", features = ["all"] }
 ttf-parser = "0.19" # measuring sidebar names for the hover marquee
+licence_format = { path = "licence_format" } # signed licence keys (src/licence.rs)
 
 [profile.release]
 lto = "thin"

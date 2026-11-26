@@ -14,6 +14,7 @@ mod dialog;
 mod drag;
 pub mod key;
 pub mod library;
+pub mod licence;
 #[macro_use]
 pub mod log;
 mod editor;
