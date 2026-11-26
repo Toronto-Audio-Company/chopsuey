@@ -183,6 +183,10 @@ impl Entry {
 
 pub struct LibraryState {
     pub config: Config,
+    /// `config` as last read from or written to disk: what this instance's
+    /// own changes are measured against when merging with other instances'
+    /// (see `save_config`).
+    base: Config,
     pub entries: Vec<Entry>,
     pub scanning: bool,
     loaded: bool,
@@ -205,6 +209,7 @@ impl Default for Library {
         Self {
             state: Mutex::new(LibraryState {
                 config: Config::default(),
+                base: Config::default(),
                 entries: vec![Entry::builtin()],
                 scanning: false,
                 loaded: false,
@@ -231,6 +236,7 @@ impl Library {
             }
             st.loaded = true;
             st.config = load_config();
+            st.base = st.config.clone();
         }
         self.rescan();
     }
@@ -253,7 +259,7 @@ impl Library {
                     st.config.folders.push(f);
                 }
             }
-            save_config(&st.config);
+            save_config(&mut st);
         }
         self.rescan();
     }
@@ -264,7 +270,7 @@ impl Library {
             if index < st.config.folders.len() {
                 st.config.folders.remove(index);
             }
-            save_config(&st.config);
+            save_config(&mut st);
         }
         self.rescan();
     }
@@ -283,7 +289,7 @@ impl Library {
         if let Some(e) = st.entries.iter_mut().find(|e| e.key == key) {
             e.favourite = on;
         }
-        save_config(&st.config);
+        save_config(&mut st);
         drop(st);
         self.bump();
     }
@@ -304,7 +310,7 @@ impl Library {
             e.scale = scale;
             e.bpm = e.base_bpm.map(|b| b * scale);
         }
-        save_config(&st.config);
+        save_config(&mut st);
         drop(st);
         self.bump();
     }
@@ -469,7 +475,7 @@ impl Library {
         st.scanning = false;
         self.busy.store(false, Ordering::Relaxed);
         self.detecting.store(0, Ordering::Relaxed);
-        save_config(&st.config);
+        save_config(&mut st);
         drop(st);
         self.bump();
         if timing {
@@ -633,25 +639,147 @@ pub fn app_folder(kind: &str) -> PathBuf {
     new
 }
 
+/// Reads the settings. A file that exists but can't be read as settings is
+/// kept as `library.json.corrupt-<time>` (and logged) rather than being
+/// overwritten with empty settings by the next save.
 fn load_config() -> Config {
-    std::fs::read(config_path())
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    read_config().unwrap_or_default()
 }
 
+fn read_config() -> Option<Config> {
+    let path = config_path();
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            let secs = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let backup = path.with_extension(format!("json.corrupt-{secs}"));
+            let _ = std::fs::rename(&path, &backup);
+            crate::logln!("library settings unreadable ({e}); kept as {}", backup.display());
+            None
+        }
+    }
+}
+
+/// Saves this instance's changes without losing other instances'.
+///
+/// Every plugin instance (and every running host) shares library.json, and
+/// each holds its own copy. Writing that copy whole would drop whatever
+/// another instance saved since we loaded (a star, a folder). Instead,
+/// under a lock file: re-read the file, apply our changes since `base` to
+/// it (a three-way merge), write that, and adopt it as our state.
 /// Writes atomically (temp file + rename) so a crash can't leave half a file.
-fn save_config(config: &Config) {
+fn save_config(st: &mut LibraryState) {
     let path = config_path();
     let Some(dir) = path.parent() else { return };
-    if std::fs::create_dir_all(dir).is_err() {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        crate::logln!("can't create {}: {e}", dir.display());
         return;
     }
-    let Ok(json) = serde_json::to_vec_pretty(config) else { return };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+    let _lock = FileLock::acquire(&path.with_extension("json.lock"));
+    let theirs = read_config().unwrap_or_else(|| st.base.clone());
+    let merged = merge_config(&st.base, &st.config, &theirs);
+    let Ok(json) = serde_json::to_vec_pretty(&merged) else { return };
+    // Unique per instance, so two writers never share a temp file.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}-{n}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        crate::logln!("couldn't save library settings: {e}");
+        return;
     }
+    // Others' stars and tempo choices show here too.
+    for e in st.entries.iter_mut() {
+        e.favourite = merged.favourites.contains(&e.key);
+    }
+    st.config = merged.clone();
+    st.base = merged;
+}
+
+/// `theirs` (what's on disk now) plus the changes `ours` made to `base`.
+fn merge_config(base: &Config, ours: &Config, theirs: &Config) -> Config {
+    let mut folders = theirs.folders.clone();
+    folders.retain(|f| ours.folders.contains(f) || !base.folders.contains(f));
+    for f in &ours.folders {
+        if !base.folders.contains(f) && !folders.contains(f) {
+            folders.push(f.clone());
+        }
+    }
+    let mut favourites = theirs.favourites.clone();
+    for k in base.favourites.difference(&ours.favourites) {
+        favourites.remove(k);
+    }
+    favourites.extend(ours.favourites.difference(&base.favourites).cloned());
+    Config {
+        folders,
+        overrides: merge_map(&base.overrides, &ours.overrides, &theirs.overrides),
+        tempo_scale: merge_map(&base.tempo_scale, &ours.tempo_scale, &theirs.tempo_scale),
+        favourites,
+        detected: merge_map(&base.detected, &ours.detected, &theirs.detected),
+        scan_cache: merge_map(&base.scan_cache, &ours.scan_cache, &theirs.scan_cache),
+    }
+}
+
+/// Per key: our value if we changed it since `base` (removal included),
+/// otherwise theirs.
+fn merge_map<V: Clone + PartialEq>(
+    base: &HashMap<String, V>,
+    ours: &HashMap<String, V>,
+    theirs: &HashMap<String, V>,
+) -> HashMap<String, V> {
+    let mut out = theirs.clone();
+    for k in base.keys().chain(ours.keys()) {
+        if ours.get(k) != base.get(k) {
+            match ours.get(k) {
+                Some(v) => out.insert(k.clone(), v.clone()),
+                None => out.remove(k),
+            };
+        }
+    }
+    out
+}
+
+/// An exclusive `flock` on a lock file, held until dropped. It covers other
+/// processes (two hosts open at once); the in-process mutex covers threads,
+/// since flock locks are per open file. If locking fails, saving goes ahead
+/// unlocked: worse to lose the save.
+struct FileLock {
+    _file: Option<std::fs::File>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> Self {
+        static IN_PROCESS: Mutex<()> = Mutex::new(());
+        let guard = IN_PROCESS.locked();
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok();
+        if let Some(f) = &file {
+            use std::os::fd::AsRawFd;
+            // Released when the file is closed.
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+        }
+        Self { _file: file, _guard: guard }
+    }
+}
+
+/// Where a sample saved with a set has gone: a file of the same name (and
+/// size, when known) that the last library scan found. Only a single
+/// unambiguous match counts. Reads the saved scan, so it's quick and
+/// doesn't need the library loaded.
+pub fn find_moved(old: &Path, size: Option<u64>) -> Option<PathBuf> {
+    let name = old.file_name()?;
+    let config = read_config()?;
+    let mut found = config.scan_cache.iter().filter(|(key, scanned)| {
+        Path::new(key.as_str()).file_name() == Some(name) && size.is_none_or(|s| s == scanned.size)
+    });
+    let (key, _) = found.next()?;
+    if found.next().is_some() {
+        return None; // more than one: don't guess
+    }
+    let path = PathBuf::from(key);
+    path.is_file().then_some(path)
 }
 
 #[cfg(test)]
@@ -670,6 +798,31 @@ mod tests {
         let mut w = hound::WavWriter::create(path, spec).unwrap();
         samples.iter().for_each(|s| w.write_sample(*s).unwrap());
         w.finalize().unwrap();
+    }
+
+    #[test]
+    fn merge_keeps_both_instances_changes() {
+        let mut base = Config::default();
+        base.folders = vec!["/a".into(), "/b".into()];
+        base.favourites.insert("old".into());
+        base.tempo_scale.insert("t".into(), 2.0);
+        // We: drop folder /b, un-star "old", star "mine", set a scale.
+        let mut ours = base.clone();
+        ours.folders.retain(|f| f.as_path() != Path::new("/b"));
+        ours.favourites.remove("old");
+        ours.favourites.insert("mine".into());
+        ours.tempo_scale.insert("u".into(), 0.5);
+        // They (saved meanwhile): add folder /c, star "theirs", clear "t".
+        let mut theirs = base.clone();
+        theirs.folders.push("/c".into());
+        theirs.favourites.insert("theirs".into());
+        theirs.tempo_scale.remove("t");
+
+        let m = merge_config(&base, &ours, &theirs);
+        assert_eq!(m.folders, vec![PathBuf::from("/a"), PathBuf::from("/c")]);
+        assert_eq!(m.favourites.iter().map(String::as_str).collect::<Vec<_>>(), ["mine", "theirs"]);
+        assert_eq!(m.tempo_scale.get("t"), None);
+        assert_eq!(m.tempo_scale.get("u"), Some(&0.5));
     }
 
     #[test]
@@ -737,6 +890,36 @@ mod tests {
         lib.set_scale(&key, 1.0);
         assert_eq!(lib.entry(&key).unwrap().bpm, Some(95.0));
         assert!(load_config().tempo_scale.get(&key).is_none());
+
+        // Another instance stars a file after this one loaded: starring here
+        // keeps theirs, and theirs shows up here.
+        let mut other = load_config();
+        other.favourites.insert("their-star".into());
+        std::fs::write(config_path(), serde_json::to_vec(&other).unwrap()).unwrap();
+        lib.toggle_favourite(&key);
+        let saved = load_config();
+        assert!(saved.favourites.contains("their-star") && saved.favourites.contains(&key));
+        assert!(lib.state.locked().config.favourites.contains("their-star"));
+
+        // A sample that moved is found again by name and size.
+        let moved = samples.join("moved");
+        std::fs::create_dir_all(&moved).unwrap();
+        let old = samples.join("Drums 124bpm.wav");
+        let size = std::fs::metadata(&old).unwrap().len();
+        let new = moved.join("Drums 124bpm.wav");
+        std::fs::rename(&old, &new).unwrap();
+        let mut config = load_config();
+        let scanned = config.scan_cache.remove(old.to_str().unwrap()).unwrap();
+        config.scan_cache.insert(new.to_string_lossy().into(), scanned);
+        std::fs::write(config_path(), serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(find_moved(&old, Some(size)), Some(new.clone()));
+        assert_eq!(find_moved(&old, Some(size + 1)), None, "a different size isn't it");
+
+        // An unreadable settings file is kept aside, not overwritten.
+        std::fs::write(config_path(), b"{ not json").unwrap();
+        assert!(load_config().folders.is_empty());
+        let kept = std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+        assert!(kept, "the corrupt file was backed up");
 
         // An old absolute override becomes the nearest scale.
         let mut config = Config::default();

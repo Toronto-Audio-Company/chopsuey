@@ -467,6 +467,7 @@ impl Shared {
     /// Copies what's selected into the state saved with the Live set.
     pub fn save_session(&self) {
         let sel = self.selection.locked().clone();
+        let file_size = sel.path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
         let analysed = self.song_view.locked().as_ref().is_some_and(|v| v.key == sel.key);
         let mut session = self.session.locked();
         let is_song = analysed || (session.is_song && session.key == sel.key);
@@ -480,6 +481,8 @@ impl Shared {
             bpm: sel.bpm,
             chop_length: self.chop_length.load(Ordering::Relaxed),
             stem_switches: self.stem_switches.load(Ordering::Relaxed),
+            version: SESSION_VERSION,
+            file_size,
         };
         *applied = session.clone();
     }
@@ -499,12 +502,31 @@ impl Shared {
     /// the audio thread then renders it once it knows the tempo, and the
     /// chop comes back after the song is analysed).
     fn restore_session(self: &Arc<Self>) -> bool {
-        let saved = self.session.locked().clone();
+        let mut saved = self.session.locked().clone();
         if saved.key.is_empty() || saved.bpm <= 0.0 {
             return false;
         }
-        if saved.path.as_ref().is_some_and(|p| !p.exists()) {
-            return false; // the file has moved since
+        if saved.version > SESSION_VERSION {
+            crate::logln!("set saved by a newer chopsuey (session v{}); restoring what this version knows", saved.version);
+        }
+        if let Some(old) = saved.path.clone().filter(|p| !p.exists()) {
+            // Moved or renamed folder, or a set from another computer: look
+            // for it in the library by name (and size).
+            let Some(found) = library::find_moved(&old, saved.file_size) else {
+                crate::logln!("saved sample missing: {}", old.display());
+                *self.render_error.locked() = Some(format!(
+                    "Can't find \u{201c}{}\u{201d}, which this set uses. It was in {}. Add the folder it's in now and reopen the set, or pick another sample.",
+                    saved.name,
+                    old.parent().map_or_else(String::new, |d| d.display().to_string()),
+                ));
+                return false;
+            };
+            crate::logln!("saved sample moved: {} -> {}", old.display(), found.display());
+            saved.key = found.to_string_lossy().into_owned();
+            saved.path = Some(found);
+            // Saving the set from now on stores the new place.
+            *self.session.locked() = saved.clone();
+            *self.applied_session.locked() = saved.clone();
         }
         if saved.chop_length > 0 {
             self.chop_length.store(saved.chop_length, Ordering::Relaxed);
@@ -809,7 +831,21 @@ impl Shared {
             restore.take(); // another song, or a chop picked since: too late
             return;
         }
-        let Some(index) = view.chops.iter().position(|c| c.start == start && c.end == end) else { return };
+        // The same frames, or (if chop detection has changed since the set
+        // was saved) the chop that overlaps the saved one most, if it
+        // covers at least half of it.
+        let overlap = |c: &chops::Chop| c.end.min(end).saturating_sub(c.start.max(start));
+        let exact = view.chops.iter().position(|c| c.start == start && c.end == end);
+        let closest = || {
+            (0..view.chops.len())
+                .max_by_key(|&i| overlap(&view.chops[i]))
+                // Half of each: a one-shot inside a long bar chop isn't it.
+                .filter(|&i| {
+                    let (o, c) = (overlap(&view.chops[i]), &view.chops[i]);
+                    o * 2 >= end.saturating_sub(start).max(1) && o * 2 >= (c.end - c.start).max(1)
+                })
+        };
+        let Some(index) = exact.or_else(closest) else { return };
         restore.take();
         let chop = view.chops[index].clone();
         let number = view.chops[..index].iter().filter(|c| c.bars == chop.bars).count() + 1;
@@ -1107,7 +1143,18 @@ pub struct SessionState {
     pub chop: Option<(usize, usize)>,
     pub chop_length: usize,
     pub stem_switches: u8,
+    /// `SESSION_VERSION` when saved; 0 for sets saved before it existed.
+    /// New fields must have serde defaults so older sets still load.
+    #[serde(default)]
+    pub version: u32,
+    /// The file's size when saved, to recognise it if it has moved.
+    #[serde(default)]
+    pub file_size: Option<u64>,
 }
+
+/// Bump when `SessionState` changes meaning, and handle the older versions
+/// in `restore_session`.
+pub const SESSION_VERSION: u32 = 1;
 
 /// Clips for MIDI pads, rendered ahead so a pad plays at once.
 pub struct PadSet {
@@ -1870,6 +1917,14 @@ nih_export_vst3!(TempoSampler);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sets saved before the session had a version still load.
+    #[test]
+    fn old_session_state_loads() {
+        let old = r#"{"key":"/x/a.wav","path":"/x/a.wav","name":"a","bpm":120.0,"is_song":false,"chop":[10,20],"chop_length":2,"stem_switches":15}"#;
+        let s: SessionState = serde_json::from_str(old).unwrap();
+        assert_eq!((s.version, s.file_size, s.chop), (0, None, Some((10, 20))));
+    }
     use std::time::{Duration, Instant};
 
     fn wait_rendered(shared: &Shared, id: u64) {

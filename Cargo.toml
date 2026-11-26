@@ -10,6 +10,12 @@ members = ["xtask"]
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+# Debug builds made with this panic on any allocation in process() (nih-plug's
+# assert_no_alloc). CI and scripts/validate.sh run the validators on such a
+# build so a realtime-safety regression fails loudly.
+rt-checks = ["nih_plug/assert_process_allocs"]
+
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
 nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
