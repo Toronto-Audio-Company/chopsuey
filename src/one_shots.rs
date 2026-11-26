@@ -118,7 +118,8 @@ pub fn find_one_shots(mono: &[f32], sample_rate: u32, bpm: f32) -> Vec<Chop> {
 /// pieces no longer than `max` where that leaves pieces of `min_piece`.
 fn split(env: &[f32], s: (usize, usize), max: usize, min_piece: usize, out: &mut Vec<(usize, usize)>) {
     let (a, b) = s;
-    if b - a <= max || b - a < 2 * min_piece {
+    // Equal to 2 * min_piece would leave no room to cut (an empty range).
+    if b - a <= max || b - a <= 2 * min_piece {
         out.push(s);
         return;
     }
@@ -126,7 +127,7 @@ fn split(env: &[f32], s: (usize, usize), max: usize, min_piece: usize, out: &mut
         let w = &env[i.saturating_sub(2)..(i + 3).min(env.len())];
         w.iter().sum::<f32>() / w.len() as f32
     };
-    let cut = (a + min_piece..b - min_piece).min_by(|&x, &y| smooth(x).total_cmp(&smooth(y))).unwrap();
+    let cut = (a + min_piece..b - min_piece).min_by(|&x, &y| smooth(x).total_cmp(&smooth(y))).unwrap_or(a + min_piece);
     split(env, (a, cut), max, min_piece, out);
     split(env, (cut, b), max, min_piece, out);
 }
@@ -194,6 +195,16 @@ mod tests {
         }
         let cut = shots[0].end as f32 / SR as f32;
         assert!((cut - 5.05).abs() < 0.1, "cut at {cut}");
+    }
+
+    /// A section exactly twice the shortest piece used to panic: the range
+    /// of places to cut was empty.
+    #[test]
+    fn split_at_exactly_two_pieces() {
+        let env = vec![0.5; 100];
+        let mut out = Vec::new();
+        split(&env, (0, 20), 5, 10, &mut out);
+        assert_eq!(out, vec![(0, 20)]);
     }
 
     #[test]

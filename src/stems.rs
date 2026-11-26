@@ -3,6 +3,7 @@
 //! The model weights' licence is unclear (possibly research-only), so this
 //! is for personal use; swap the model before distributing the plugin.
 
+use crate::safety::LockExt;
 use std::path::Path;
 
 use ort::session::Session;
@@ -75,7 +76,7 @@ impl Separator {
         if engine.gpu {
             match build_session(model, 2, true) {
                 Ok(session) => workers.push(Worker { label: "gpu", session: session.into() }),
-                Err(e) => eprintln!("chopsuey: WebGPU unavailable, using CPU ({e})"),
+                Err(e) => crate::logln!("chopsuey: WebGPU unavailable, using CPU ({e})"),
             }
         }
         if engine.cpu_threads > 0 || workers.is_empty() {
@@ -162,13 +163,13 @@ impl Separator {
                 let (next, done, error, offsets, cancelled, run_window) =
                     (&next, &done, &error, &offsets, &cancelled, &run_window);
                 scope.spawn(move || loop {
-                    if cancelled() || error.lock().unwrap().is_some() {
+                    if cancelled() || error.locked().is_some() {
                         break;
                     }
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(&offset) = offsets.get(i) else { break };
                     if let Err(e) = run_window(&worker.session, offset) {
-                        *error.lock().unwrap() = Some(e);
+                        *error.locked() = Some(e);
                         break;
                     }
                     done.fetch_add(1, Ordering::Relaxed);
@@ -178,7 +179,7 @@ impl Separator {
             loop {
                 let d = done.load(Ordering::Relaxed);
                 progress(d as f32 / offsets.len() as f32);
-                if d >= offsets.len() || cancelled() || error.lock().unwrap().is_some() {
+                if d >= offsets.len() || cancelled() || error.locked().is_some() {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));

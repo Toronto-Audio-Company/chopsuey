@@ -27,7 +27,8 @@ ttf-parser = "0.19" # measuring sidebar names for the hover marquee
 
 [profile.release]
 lto = "thin"
-strip = "symbols"
+# Keep function names (not debug info) so panic backtraces in the log are readable.
+strip = "debuginfo"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

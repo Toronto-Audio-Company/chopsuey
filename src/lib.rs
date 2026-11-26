@@ -1,3 +1,4 @@
+use crate::safety::LockExt;
 use atomic_float::{AtomicF32, AtomicF64};
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
@@ -13,10 +14,13 @@ mod dialog;
 mod drag;
 pub mod key;
 pub mod library;
+#[macro_use]
+pub mod log;
 mod editor;
 mod logo;
 pub mod loops;
 pub mod one_shots;
+pub mod safety;
 pub mod stems;
 
 use library::Library;
@@ -247,6 +251,9 @@ pub struct Shared {
     /// Bit i set: the chop tile with `song_view.chops` index i has its pad
     /// held (tiles past 63 don't light up).
     pub pads_down: AtomicU64,
+    /// The audio thread hit a bug and went silent (see `process`). The GUI
+    /// says so; re-initialising the plugin clears it.
+    pub audio_fault: AtomicBool,
     /// Saved with the Live set (the same Arc as the persisted param field).
     pub session: Arc<Mutex<SessionState>>,
     /// The session state currently in effect (last restored or saved). When
@@ -315,9 +322,9 @@ impl Shared {
     /// loop or short sample. Cheap when nothing changed.
     pub fn refresh_pads(self: &Arc<Self>) {
         let tempo = self.transport.tempo.load(Ordering::Relaxed);
-        let selection = self.selection.lock().unwrap().clone();
+        let selection = self.selection.locked().clone();
         let length = self.chop_length.load(Ordering::Relaxed);
-        let view = self.song_view.lock().unwrap().clone().filter(|v| v.key == selection.key);
+        let view = self.song_view.locked().clone().filter(|v| v.key == selection.key);
         let sig = match &view {
             Some(v) if tempo > 0.0 => format!(
                 "{}|{}|{}|{length}|{tempo}|{}|{}|{:?}",
@@ -331,15 +338,15 @@ impl Shared {
             _ => "current".to_string(),
         };
         {
-            let mut built = self.pads_sig.lock().unwrap();
+            let mut built = self.pads_sig.locked();
             if *built == sig {
                 return;
             }
             *built = sig.clone();
         }
         let send = |set: PadSet| {
-            while self.pad_garbage.lock().unwrap().pop().is_ok() {}
-            let _ = self.to_audio_pads.lock().unwrap().push(Arc::new(set));
+            while self.pad_garbage.locked().pop().is_ok() {}
+            let _ = self.to_audio_pads.locked().push(Arc::new(set));
         };
         let Some(view) = view.filter(|_| tempo > 0.0) else {
             send(PadSet { clips: Vec::new(), chop_indices: Vec::new(), play_current: true, gain: 1.0 });
@@ -348,40 +355,37 @@ impl Shared {
         // Silence the old song's pads at once, then render this one's.
         send(PadSet { clips: Vec::new(), chop_indices: Vec::new(), play_current: false, gain: 1.0 });
         let shared = self.clone();
-        std::thread::Builder::new()
-            .name("tempo-sampler-pads".into())
-            .spawn(move || {
-                let Ok(src) = shared.source(&selection) else { return };
-                let indices: Vec<usize> = (0..view.chops.len()).filter(|&i| view.chops[i].bars == length).collect();
-                let total = view.frames.max(1) as f32;
-                let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-                let rendered = library::parallel_map(&indices, threads, |&i| {
-                    let chop = view.chops[i].clone();
-                    let number = indices.iter().position(|&j| j == i).unwrap_or(0) + 1;
-                    let mut sel = selection.clone();
-                    sel.chop = Some(ChopSel { index: i, number, chop: chop.clone() });
-                    let asset = shared.make_asset(&sel, &src).ok()?;
-                    let mut r = shared.at_host_rate(asset.stretch_to(tempo));
-                    r.span = Some((chop.start as f32 / total, chop.end as f32 / total));
-                    Some((i, Arc::new(r)))
-                });
-                if *shared.pads_sig.lock().unwrap() != sig {
-                    return; // superseded while rendering
-                }
-                let (chop_indices, clips) = rendered.into_iter().unzip();
-                while shared.pad_garbage.lock().unwrap().pop().is_ok() {}
-                let _ = shared
-                    .to_audio_pads
-                    .lock()
-                    .unwrap()
-                    .push(Arc::new(PadSet {
-                        clips,
-                        chop_indices,
-                        play_current: false,
-                        gain: shared.loudness_gain(&selection.key),
-                    }));
-            })
-            .ok();
+        crate::safety::spawn("tempo-sampler-pads", move || {
+            let Ok(src) = shared.source(&selection) else { return };
+            let indices: Vec<usize> = (0..view.chops.len()).filter(|&i| view.chops[i].bars == length).collect();
+            let total = view.frames.max(1) as f32;
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+            let rendered = library::parallel_map(&indices, threads, |&i| {
+                let chop = view.chops[i].clone();
+                let number = indices.iter().position(|&j| j == i).unwrap_or(0) + 1;
+                let mut sel = selection.clone();
+                sel.chop = Some(ChopSel { index: i, number, chop: chop.clone() });
+                let asset = shared.make_asset(&sel, &src).ok()?;
+                let mut r = shared.at_host_rate(asset.stretch_to(tempo));
+                r.span = Some((chop.start as f32 / total, chop.end as f32 / total));
+                Some((i, Arc::new(r)))
+            });
+            if *shared.pads_sig.locked() != sig {
+                return; // superseded while rendering
+            }
+            let (chop_indices, clips) = rendered.into_iter().unzip();
+            while shared.pad_garbage.locked().pop().is_ok() {}
+            let _ = shared
+                .to_audio_pads
+                
+                .locked()
+                .push(Arc::new(PadSet {
+                    clips,
+                    chop_indices,
+                    play_current: false,
+                    gain: shared.loudness_gain(&selection.key),
+                }));
+        });
     }
 
     /// Brings the plugin in line with its parameters, the way the same
@@ -394,7 +398,7 @@ impl Shared {
         // Stems (at least one stays on). Applied to the selection once its
         // stems are ready; until then the switches wait.
         if stem_mask != 0 && self.stem_switches.swap(stem_mask, Ordering::Relaxed) != stem_mask {
-            let mut sel = self.selection.lock().unwrap();
+            let mut sel = self.selection.locked();
             if self.stems_for(&sel.key).is_some() && sel.stem_mask != stem_mask {
                 sel.stem_mask = stem_mask;
                 rerender = true;
@@ -405,11 +409,11 @@ impl Shared {
             self.save_session();
         }
         // ½× / 1× / 2× for the selected file (saved per file, as in the GUI).
-        let key = self.selection.lock().unwrap().key.clone();
+        let key = self.selection.locked().key.clone();
         if let Some(entry) = self.library.entry(&key) {
             if let (Some(base), true) = (entry.base_bpm, entry.scale != tempo_scale) {
                 self.library.set_scale(&key, tempo_scale);
-                let mut sel = self.selection.lock().unwrap();
+                let mut sel = self.selection.locked();
                 if sel.key == key {
                     sel.bpm = base * tempo_scale;
                     sel.chop = None; // chops belong to the old tempo's analysis
@@ -455,18 +459,18 @@ impl Shared {
     /// Marks the current selection as the clip the audio thread should play
     /// (not from the audio thread: it locks the selection).
     pub fn want_selection(&self) {
-        let key = self.selection.lock().unwrap().render_key();
+        let key = self.selection.locked().render_key();
         self.wanted_key.store(loops::key_hash(&key), Ordering::Relaxed);
         self.save_session();
     }
 
     /// Copies what's selected into the state saved with the Live set.
     pub fn save_session(&self) {
-        let sel = self.selection.lock().unwrap().clone();
-        let analysed = self.song_view.lock().unwrap().as_ref().is_some_and(|v| v.key == sel.key);
-        let mut session = self.session.lock().unwrap();
+        let sel = self.selection.locked().clone();
+        let analysed = self.song_view.locked().as_ref().is_some_and(|v| v.key == sel.key);
+        let mut session = self.session.locked();
         let is_song = analysed || (session.is_song && session.key == sel.key);
-        let mut applied = self.applied_session.lock().unwrap();
+        let mut applied = self.applied_session.locked();
         *session = SessionState {
             is_song,
             chop: sel.chop.as_ref().map(|c| (c.chop.start, c.chop.end)),
@@ -483,11 +487,11 @@ impl Shared {
     /// Restores the session if the host loaded state that isn't in effect
     /// yet. True if it did (the selection changed, so re-render).
     fn restore_if_loaded(self: &Arc<Self>) -> bool {
-        let saved = self.session.lock().unwrap().clone();
-        if *self.applied_session.lock().unwrap() == saved {
+        let saved = self.session.locked().clone();
+        if *self.applied_session.locked() == saved {
             return false;
         }
-        *self.applied_session.lock().unwrap() = saved;
+        *self.applied_session.locked() = saved;
         self.restore_session()
     }
 
@@ -495,7 +499,7 @@ impl Shared {
     /// the audio thread then renders it once it knows the tempo, and the
     /// chop comes back after the song is analysed).
     fn restore_session(self: &Arc<Self>) -> bool {
-        let saved = self.session.lock().unwrap().clone();
+        let saved = self.session.locked().clone();
         if saved.key.is_empty() || saved.bpm <= 0.0 {
             return false;
         }
@@ -508,7 +512,7 @@ impl Shared {
         if saved.stem_switches != 0 {
             self.stem_switches.store(saved.stem_switches, Ordering::Relaxed);
         }
-        *self.selection.lock().unwrap() = Selection {
+        *self.selection.locked() = Selection {
             key: saved.key.clone(),
             path: saved.path.clone(),
             name: saved.name.clone(),
@@ -517,14 +521,14 @@ impl Shared {
             stem_mask: ALL_STEMS,
         };
         if let Some((start, end)) = saved.chop {
-            *self.restore_chop.lock().unwrap() = Some((saved.key.clone(), start, end));
+            *self.restore_chop.locked() = Some((saved.key.clone(), start, end));
         }
         if saved.is_song {
             if let Some(path) = &saved.path {
                 self.request_stems(&saved.key, path); // from the cache if split before
             }
         }
-        let key = self.selection.lock().unwrap().render_key();
+        let key = self.selection.locked().render_key();
         self.wanted_key.store(loops::key_hash(&key), Ordering::Relaxed);
         true
     }
@@ -539,13 +543,13 @@ impl Shared {
     }
 
     pub fn current(&self) -> Option<Arc<RenderedLoop>> {
-        self.current.lock().unwrap().clone()
+        self.current.locked().clone()
     }
 
     /// The current render and its waveform.
     pub fn current_with_overview(&self) -> Option<(Arc<RenderedLoop>, Arc<Vec<(f32, f32)>>)> {
-        let _guard = self.publish_lock.lock().unwrap();
-        Some((self.current()?, self.current_overview.lock().unwrap().clone()))
+        let _guard = self.publish_lock.locked();
+        Some((self.current()?, self.current_overview.locked().clone()))
     }
 
     /// Runs on nih-plug's background thread.
@@ -553,19 +557,19 @@ impl Shared {
         if self.latest_request.load(Ordering::Relaxed) != id {
             return; // superseded while queued
         }
-        while self.garbage.lock().unwrap().pop().is_ok() {}
+        while self.garbage.locked().pop().is_ok() {}
 
-        let selection = self.selection.lock().unwrap().clone();
+        let selection = self.selection.locked().clone();
         self.preview_gain.store(self.loudness_gain(&selection.key), Ordering::Relaxed);
         let asset = match self.load(&selection) {
             Ok(asset) => asset,
             Err(e) => {
-                *self.render_error.lock().unwrap() = Some(e);
+                *self.render_error.locked() = Some(e);
                 self.rendered_request.store(id, Ordering::Relaxed);
                 return;
             }
         };
-        *self.render_error.lock().unwrap() = None;
+        *self.render_error.locked() = None;
 
         let span = self.span_of(&selection);
         let secs = asset.frames() as f32 / asset.sample_rate as f32;
@@ -576,35 +580,29 @@ impl Shared {
             // replaces them without a jump (same tempo, same start).
             // Stale results are dropped in publish().
             let shared = self.clone();
-            std::thread::Builder::new()
-                .name("tempo-sampler-song".into())
-                .spawn(move || {
-                    let current = || shared.latest_request.load(Ordering::Relaxed) == id;
-                    let start_frames = (START_RENDER_SECS * asset.sample_rate as f32) as usize;
-                    if current() && asset.frames() > start_frames * 2 {
-                        let mut start = shared.at_host_rate(asset.stretch_start(bpm, start_frames));
-                        let part = start_frames as f32 / asset.frames() as f32;
-                        start.span = span.map(|(a, b)| (a, a + (b - a) * part));
-                        shared.publish(id, bpm, start);
-                    }
-                    // Gives up between pieces once a newer request exists, so
-                    // flicking through songs doesn't pile up stretches.
-                    if let Some(rendered) = asset.stretch_to_cancellable(bpm, &|| !current()) {
-                        let mut rendered = shared.at_host_rate(rendered);
-                        rendered.span = span;
-                        shared.publish(id, bpm, rendered);
-                    }
-                })
-                .ok();
+            crate::safety::spawn("tempo-sampler-song", move || {
+                let current = || shared.latest_request.load(Ordering::Relaxed) == id;
+                let start_frames = (START_RENDER_SECS * asset.sample_rate as f32) as usize;
+                if current() && asset.frames() > start_frames * 2 {
+                    let mut start = shared.at_host_rate(asset.stretch_start(bpm, start_frames));
+                    let part = start_frames as f32 / asset.frames() as f32;
+                    start.span = span.map(|(a, b)| (a, a + (b - a) * part));
+                    shared.publish(id, bpm, start);
+                }
+                // Gives up between pieces once a newer request exists, so
+                // flicking through songs doesn't pile up stretches.
+                if let Some(rendered) = asset.stretch_to_cancellable(bpm, &|| !current()) {
+                    let mut rendered = shared.at_host_rate(rendered);
+                    rendered.span = span;
+                    shared.publish(id, bpm, rendered);
+                }
+            });
             // Find chops on another thread while it stretches (the whole
             // song plays without them), leaving this one free for the next
             // request (a chop click, say).
             if let Ok(src) = self.source(&selection) {
                 let (shared, selection) = (self.clone(), selection.clone());
-                std::thread::Builder::new()
-                    .name("tempo-sampler-chops".into())
-                    .spawn(move || shared.analyse_if_song(&selection, &src))
-                    .ok();
+                crate::safety::spawn("tempo-sampler-chops", move || shared.analyse_if_song(&selection, &src));
             }
         } else {
             let mut rendered = self.at_host_rate(asset.stretch_to(bpm));
@@ -627,20 +625,20 @@ impl Shared {
     fn publish(&self, id: u64, bpm: f32, rendered: RenderedLoop) {
         // Outside the lock: the GUI takes it to draw.
         let overview = Arc::new(min_max_overview_stereo(&rendered.samples, OVERVIEW_POINTS));
-        let _guard = self.publish_lock.lock().unwrap();
+        let _guard = self.publish_lock.locked();
         if self.latest_request.load(Ordering::Relaxed) != id {
             return; // superseded while stretching
         }
         // Free buffers the audio thread handed back (song renders publish
         // from their own thread, so render() alone may not keep up).
-        while self.garbage.lock().unwrap().pop().is_ok() {}
+        while self.garbage.locked().pop().is_ok() {}
         let partial = rendered.partial;
         let rendered = Arc::new(rendered);
-        *self.current.lock().unwrap() = Some(rendered.clone());
-        *self.current_overview.lock().unwrap() = overview;
+        *self.current.locked() = Some(rendered.clone());
+        *self.current_overview.locked() = overview;
         // If the queue is full the audio thread isn't running; the GUI still
         // has the render, and the next one will get through.
-        let _ = self.to_audio.lock().unwrap().push(rendered);
+        let _ = self.to_audio.locked().push(rendered);
         if !partial {
             self.rendered_bpm.store(bpm, Ordering::Relaxed);
             self.rendered_request.store(id, Ordering::Relaxed);
@@ -649,7 +647,7 @@ impl Shared {
 
     /// Where the selection sits in its file, for the playhead.
     fn span_of(&self, selection: &Selection) -> Option<(f32, f32)> {
-        let view = self.song_view.lock().unwrap().clone();
+        let view = self.song_view.locked().clone();
         let Some(view) = view.filter(|v| v.key == selection.key && v.frames > 0) else {
             // Not analysed (a loop, or a song still being analysed): the
             // whole file is playing.
@@ -671,7 +669,7 @@ impl Shared {
     /// decoded last. The lock is held while decoding, so the render and
     /// stems threads asking for the same file decode it once between them.
     fn decoded(&self, key: &str, path: Option<&std::path::Path>, name: &str) -> Result<Arc<Source>, String> {
-        let mut cached = self.source.lock().unwrap();
+        let mut cached = self.source.locked();
         if let Some((k, src)) = cached.as_ref() {
             if k == key {
                 return Ok(src.clone());
@@ -695,14 +693,14 @@ impl Shared {
     /// The selection's audio at its original tempo (whole file or a chop),
     /// reusing the last one if unchanged.
     fn load(&self, selection: &Selection) -> Result<Arc<LoopAsset>, String> {
-        if let Some((sel, asset)) = self.loaded.lock().unwrap().as_ref() {
+        if let Some((sel, asset)) = self.loaded.locked().as_ref() {
             if sel == selection && asset.pitch == self.pitch() {
                 return Ok(asset.clone());
             }
         }
         let src = self.source(selection)?;
         let asset = Arc::new(self.make_asset(selection, &src)?);
-        *self.loaded.lock().unwrap() = Some((selection.clone(), asset.clone()));
+        *self.loaded.locked() = Some((selection.clone(), asset.clone()));
         Ok(asset)
     }
 
@@ -745,7 +743,7 @@ impl Shared {
         if secs < SONG_MIN_SECS || bpm::is_loop(secs, selection.bpm) {
             return;
         }
-        if let Some(view) = self.song_view.lock().unwrap().as_ref() {
+        if let Some(view) = self.song_view.locked().as_ref() {
             if view.key == selection.key && view.bpm == selection.bpm {
                 return;
             }
@@ -753,7 +751,7 @@ impl Shared {
         // One analysis per file and tempo at a time (renders come in bursts).
         let job = format!("{}@{}", selection.key, selection.bpm);
         {
-            let mut running = self.analysing.lock().unwrap();
+            let mut running = self.analysing.locked();
             if running.as_deref() == Some(job.as_str()) {
                 return;
             }
@@ -775,7 +773,7 @@ impl Shared {
             chop_overviews.push(min_max_overview(&mono[shot.start..shot.end], CHOP_OVERVIEW_POINTS));
             chops.push(shot);
         }
-        *self.song_view.lock().unwrap() = Some(Arc::new(SongView {
+        *self.song_view.locked() = Some(Arc::new(SongView {
             key: selection.key.clone(),
             bpm: selection.bpm,
             frames: src.frames(),
@@ -788,10 +786,10 @@ impl Shared {
         }));
         self.restore_saved_chop();
         self.song_view_version.fetch_add(1, Ordering::Relaxed);
-        let current = self.selection.lock().unwrap().clone();
+        let current = self.selection.locked().clone();
         self.update_one_shots(&current);
         {
-            let mut running = self.analysing.lock().unwrap();
+            let mut running = self.analysing.locked();
             if running.as_deref() == Some(job.as_str()) {
                 *running = None;
             }
@@ -804,10 +802,10 @@ impl Shared {
     /// its frames exists (bar chops after analysis; a one-shot maybe only
     /// once its stems are on).
     fn restore_saved_chop(&self) {
-        let Some(view) = self.song_view.lock().unwrap().clone() else { return };
-        let mut restore = self.restore_chop.lock().unwrap();
+        let Some(view) = self.song_view.locked().clone() else { return };
+        let mut restore = self.restore_chop.locked();
         let Some((key, start, end)) = restore.clone() else { return };
-        if key != view.key || self.selection.lock().unwrap().chop.is_some() {
+        if key != view.key || self.selection.locked().chop.is_some() {
             restore.take(); // another song, or a chop picked since: too late
             return;
         }
@@ -815,7 +813,7 @@ impl Shared {
         restore.take();
         let chop = view.chops[index].clone();
         let number = view.chops[..index].iter().filter(|c| c.bars == chop.bars).count() + 1;
-        let mut sel = self.selection.lock().unwrap();
+        let mut sel = self.selection.locked();
         if sel.key == key {
             sel.chop = Some(ChopSel { index, number, chop });
         }
@@ -825,7 +823,7 @@ impl Shared {
     /// playing (the stems that are on), if that changed. Returns whether
     /// the song view changed.
     fn update_one_shots(&self, selection: &Selection) -> bool {
-        let Some(view) = self.song_view.lock().unwrap().clone().filter(|v| v.key == selection.key) else {
+        let Some(view) = self.song_view.locked().clone().filter(|v| v.key == selection.key) else {
             return false;
         };
         let mask = selection.stem_mask;
@@ -862,17 +860,17 @@ impl Shared {
             one_shot_mask: mask,
         });
         {
-            let mut current = self.song_view.lock().unwrap();
+            let mut current = self.song_view.locked();
             if !current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &view)) {
                 return false; // replaced meanwhile
             }
             *current = Some(new.clone());
         }
-        *self.mixed_overviews.lock().unwrap() = None;
+        *self.mixed_overviews.locked() = None;
         // A selected one-shot keeps playing; its tile is found again if
         // it's still there.
         {
-            let mut sel = self.selection.lock().unwrap();
+            let mut sel = self.selection.locked();
             if sel.key == new.key {
                 if let Some(c) = sel.chop.as_mut().filter(|c| c.chop.bars == one_shots::ONE_SHOT) {
                     match new.chops.iter().position(|x| x.start == c.chop.start && x.end == c.chop.end) {
@@ -892,7 +890,7 @@ impl Shared {
 
     /// The selected song's stems, if they're ready.
     pub fn stems_for(&self, key: &str) -> Option<Arc<stems::Stems>> {
-        self.stems.lock().unwrap().as_ref().filter(|(k, _)| k == key).map(|(_, s)| s.clone())
+        self.stems.locked().as_ref().filter(|(k, _)| k == key).map(|(_, s)| s.clone())
     }
 
     /// Stem mask to use for `key` right now: the switches if its stems are
@@ -920,11 +918,11 @@ impl Shared {
     /// a different song. Called when a song is selected.
     pub fn request_stems(self: &Arc<Self>, key: &str, path: &std::path::Path) {
         if self.stems_for(key).is_some() {
-            *self.stem_state.lock().unwrap() = (key.to_string(), StemState::Ready);
+            *self.stem_state.locked() = (key.to_string(), StemState::Ready);
             return;
         }
         let cancel = {
-            let mut job = self.stem_job.lock().unwrap();
+            let mut job = self.stem_job.locked();
             if let Some((running, flag)) = job.as_ref() {
                 if running == key {
                     return; // already on it
@@ -935,76 +933,73 @@ impl Shared {
             *job = Some((key.to_string(), flag.clone()));
             flag
         };
-        *self.stem_state.lock().unwrap() = (key.to_string(), StemState::Loading);
+        *self.stem_state.locked() = (key.to_string(), StemState::Loading);
         self.stem_progress.store(0.0, Ordering::Relaxed);
 
         let shared = self.clone();
         let (key, path) = (key.to_string(), path.to_path_buf());
-        std::thread::Builder::new()
-            .name("tempo-sampler-stems".into())
-            .spawn(move || {
-                let set_state = |state: StemState| {
-                    if !cancel.load(Ordering::Relaxed) {
-                        *shared.stem_state.lock().unwrap() = (key.clone(), state);
-                    }
-                };
-                let result = (|| -> Result<Option<stems::Stems>, String> {
-                    let dir = stems::cache_dir_for(&path);
-                    if let Some(cached) = dir.as_deref().and_then(stems::load_cached) {
-                        return Ok(Some(cached));
-                    }
-                    set_state(StemState::Splitting);
-                    // Usually already decoded (or being decoded) for playback.
-                    let src = shared.decoded(&key, Some(&path), "the song")?;
-                    let separated = stems::with_separator(|sep| {
-                        sep.separate(
-                            &src.samples,
-                            src.sample_rate,
-                            |p| shared.stem_progress.store(p, Ordering::Relaxed),
-                            || cancel.load(Ordering::Relaxed),
-                        )
-                    })??;
-                    if let (Some(st), Some(dir)) = (&separated, &dir) {
-                        // A failed cache write only costs a re-split later.
-                        let _ = stems::save_cached(dir, st);
-                    }
-                    Ok(separated)
-                })();
-                match result {
-                    Ok(Some(st)) if !cancel.load(Ordering::Relaxed) => {
-                        *shared.stems.lock().unwrap() = Some((key.clone(), Arc::new(st)));
-                        set_state(StemState::Ready);
-                        // Apply the switches if this song is still selected.
-                        let switches = shared.stem_switches.load(Ordering::Relaxed);
-                        let rerender = {
-                            let mut sel = shared.selection.lock().unwrap();
-                            if sel.key == key && sel.stem_mask != switches {
-                                sel.stem_mask = switches;
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if rerender {
-                            shared.render_now();
+        crate::safety::spawn("tempo-sampler-stems", move || {
+            let set_state = |state: StemState| {
+                if !cancel.load(Ordering::Relaxed) {
+                    *shared.stem_state.locked() = (key.clone(), state);
+                }
+            };
+            let result = (|| -> Result<Option<stems::Stems>, String> {
+                let dir = stems::cache_dir_for(&path);
+                if let Some(cached) = dir.as_deref().and_then(stems::load_cached) {
+                    return Ok(Some(cached));
+                }
+                set_state(StemState::Splitting);
+                // Usually already decoded (or being decoded) for playback.
+                let src = shared.decoded(&key, Some(&path), "the song")?;
+                let separated = stems::with_separator(|sep| {
+                    sep.separate(
+                        &src.samples,
+                        src.sample_rate,
+                        |p| shared.stem_progress.store(p, Ordering::Relaxed),
+                        || cancel.load(Ordering::Relaxed),
+                    )
+                })??;
+                if let (Some(st), Some(dir)) = (&separated, &dir) {
+                    // A failed cache write only costs a re-split later.
+                    let _ = stems::save_cached(dir, st);
+                }
+                Ok(separated)
+            })();
+            match result {
+                Ok(Some(st)) if !cancel.load(Ordering::Relaxed) => {
+                    *shared.stems.locked() = Some((key.clone(), Arc::new(st)));
+                    set_state(StemState::Ready);
+                    // Apply the switches if this song is still selected.
+                    let switches = shared.stem_switches.load(Ordering::Relaxed);
+                    let rerender = {
+                        let mut sel = shared.selection.locked();
+                        if sel.key == key && sel.stem_mask != switches {
+                            sel.stem_mask = switches;
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    if rerender {
+                        shared.render_now();
                     }
-                    Ok(_) => {} // cancelled
-                    Err(e) => set_state(StemState::Failed(e)),
                 }
-                let mut job = shared.stem_job.lock().unwrap();
-                if job.as_ref().is_some_and(|(k, _)| *k == key) {
-                    *job = None;
-                }
-            })
-            .ok();
+                Ok(_) => {} // cancelled
+                Err(e) => set_state(StemState::Failed(e)),
+            }
+            let mut job = shared.stem_job.locked();
+            if job.as_ref().is_some_and(|(k, _)| *k == key) {
+                *job = None;
+            }
+        });
     }
 
     /// Waveform overviews of every chop, mixed from the enabled stems.
     /// Cached per song and mask; `None` if the stems aren't ready.
     pub fn mixed_chop_overviews(&self, mask: u8) -> Option<Arc<Vec<Vec<(f32, f32)>>>> {
-        let view = self.song_view.lock().unwrap().clone()?;
-        if let Some((key, m, cached)) = self.mixed_overviews.lock().unwrap().as_ref() {
+        let view = self.song_view.locked().clone()?;
+        if let Some((key, m, cached)) = self.mixed_overviews.locked().as_ref() {
             if *key == view.key && *m == mask {
                 return Some(cached.clone());
             }
@@ -1016,14 +1011,14 @@ impl Shared {
             .map(|c| min_max_overview_mixed(&stems, mask, c.start, c.end, CHOP_OVERVIEW_POINTS))
             .collect();
         let overviews = Arc::new(overviews);
-        *self.mixed_overviews.lock().unwrap() = Some((view.key.clone(), mask, overviews.clone()));
+        *self.mixed_overviews.locked() = Some((view.key.clone(), mask, overviews.clone()));
         Some(overviews)
     }
 
     /// Exports the current selection at the host tempo (the drag area and
     /// "Show WAV in Finder").
     pub fn export_current(&self) -> Result<PathBuf, String> {
-        let selection = self.selection.lock().unwrap().clone();
+        let selection = self.selection.locked().clone();
         self.export_for_drag(&selection, self.transport.tempo.load(Ordering::Relaxed))
     }
 
@@ -1086,7 +1081,7 @@ impl Shared {
     /// Writes a render to the export folder. Song renders can be tens of
     /// MB, so the same render is written at most once.
     fn write_export(&self, rendered: Arc<RenderedLoop>) -> Result<PathBuf, String> {
-        let mut exported = self.exported.lock().unwrap();
+        let mut exported = self.exported.locked();
         if let Some((done, path)) = exported.as_ref() {
             if Arc::ptr_eq(done, &rendered) && path.exists() {
                 return Ok(path.clone());
@@ -1176,6 +1171,8 @@ pub struct TempoSampler {
     voices: [Option<Voice>; MAX_VOICES],
     /// Slot of the most recent hit, for the playhead.
     last_voice: usize,
+    /// `process` panicked: output silence until the next `initialize`.
+    faulted: bool,
     /// Parameter values last handed to `apply_params`.
     applied_params: ParamValues,
 }
@@ -1336,6 +1333,7 @@ struct Voice {
 
 impl Default for TempoSampler {
     fn default() -> Self {
+        crate::safety::install_panic_hook();
         let (to_audio, from_render) = rtrb::RingBuffer::new(8);
         let (to_garbage, garbage) = rtrb::RingBuffer::new(16);
         let (to_audio_pads, from_pads) = rtrb::RingBuffer::new(4);
@@ -1355,6 +1353,7 @@ impl Default for TempoSampler {
             to_audio_pads: Mutex::new(to_audio_pads),
             pad_garbage: Mutex::new(pad_garbage),
             pads_down: AtomicU64::new(0),
+            audio_fault: AtomicBool::new(false),
             host_rate: std::sync::atomic::AtomicU32::new(0),
             transpose: AtomicI32::new(0),
             detune: AtomicI32::new(0),
@@ -1420,6 +1419,7 @@ impl Default for TempoSampler {
             pads: None,
             voices: std::array::from_fn(|_| None),
             last_voice: 0,
+            faulted: false,
             applied_params: ParamValues { stem_mask: ALL_STEMS, chop_length: 2, tempo_scale: 1.0, pitch: Pitch::NONE },
         }
     }
@@ -1508,7 +1508,8 @@ impl TempoSampler {
 
 impl Plugin for TempoSampler {
     const NAME: &'static str = "chopsuey";
-    const VENDOR: &'static str = "chopsuey";
+    const VENDOR: &'static str = "Toronto Audio Company";
+    // Release blocker: the company site and support address go here.
     const URL: &'static str = "";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -1532,9 +1533,11 @@ impl Plugin for TempoSampler {
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let shared = self.shared.clone();
-        Box::new(move |task| match task {
-            Task::Render { id, bpm } => shared.render(id, bpm),
-            Task::ApplyParams(values) => shared.apply_params(values),
+        Box::new(move |task| {
+            crate::safety::guard("background task", || match task {
+                Task::Render { id, bpm } => shared.render(id, bpm),
+                Task::ApplyParams(values) => shared.apply_params(values),
+            });
         })
     }
 
@@ -1573,6 +1576,16 @@ impl Plugin for TempoSampler {
         // pitch lives only in its parameters: take it from them, and
         // re-render if it differs from what was playing.
         self.applied_params = self.param_values();
+        // Recover from an audio-thread panic: start again with no voices.
+        if self.faulted {
+            self.faulted = false;
+            self.shared.audio_fault.store(false, Ordering::Relaxed);
+            for v in self.voices.iter_mut() {
+                if let Some(v) = v.take() {
+                    let _ = self.to_garbage.push(v.clip);
+                }
+            }
+        }
         if self.shared.set_pitch(self.applied_params.pitch) {
             self.requested_bpm = 0.0;
         }
@@ -1585,6 +1598,29 @@ impl Plugin for TempoSampler {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        // A panic unwinding into the host would abort it (Live quits, the
+        // set is lost). Catch it, go silent, and stay silent until the host
+        // re-initialises the plugin. Costs nothing unless something panics.
+        if !self.faulted {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.process_block(buffer, context)));
+            match result {
+                Ok(status) => return status,
+                Err(_) => {
+                    self.faulted = true;
+                    self.shared.audio_fault.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        for channel in buffer.as_slice() {
+            channel.fill(0.0);
+        }
+        ProcessStatus::Normal
+    }
+}
+
+impl TempoSampler {
+    /// One block of audio: what `process` runs, inside its panic guard.
+    fn process_block(&mut self, buffer: &mut Buffer, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
         // An instrument: the output starts silent and previews are added.
         for channel in buffer.as_slice() {
             channel.fill(0.0);
@@ -1806,11 +1842,10 @@ impl Plugin for TempoSampler {
 }
 
 impl ClapPlugin for TempoSampler {
-    // IDs keep the old name on purpose: hosts identify the plugin by them,
-    // so sets made before the rename still find it.
-    const CLAP_ID: &'static str = "dev.temposampler.tempo-sampler";
+    // Hosts identify the plugin by this: never change it after release.
+    const CLAP_ID: &'static str = "com.torontoaudiocompany.chopsuey";
     const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Shows the host tempo and stretches a loop to match it");
+        Some("Browse, chop and stretch samples to your set's tempo");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
@@ -1822,7 +1857,8 @@ impl ClapPlugin for TempoSampler {
 
 impl Vst3Plugin for TempoSampler {
     // Must be exactly 16 bytes and never change once people use the plugin,
-    // or Ableton will treat it as a different plugin.
+    // or Ableton will treat it as a different plugin. It keeps the old name
+    // on purpose so sets made before the rename still find it.
     const VST3_CLASS_ID: [u8; 16] = *b"TempoSamplerV001";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
         &[Vst3SubCategory::Instrument, Vst3SubCategory::Sampler, Vst3SubCategory::Stereo];
@@ -1872,7 +1908,7 @@ mod tests {
 
         let plugin = TempoSampler::default();
         let shared = plugin.shared.clone();
-        *shared.selection.lock().unwrap() = Selection {
+        *shared.selection.locked() = Selection {
             key: path.to_string_lossy().into(),
             path: Some(path.clone()),
             name: "shouts".into(),
@@ -1880,10 +1916,10 @@ mod tests {
             chop: None,
             stem_mask: ALL_STEMS,
         };
-        let src = shared.source(&shared.selection.lock().unwrap().clone()).unwrap();
-        let selection = shared.selection.lock().unwrap().clone();
+        let src = shared.source(&shared.selection.locked().clone()).unwrap();
+        let selection = shared.selection.locked().clone();
         shared.analyse_if_song(&selection, &src);
-        let view = shared.song_view.lock().unwrap().clone().expect("analysed");
+        let view = shared.song_view.locked().clone().expect("analysed");
         let shots: Vec<usize> = (0..view.chops.len()).filter(|&i| view.chops[i].bars == one_shots::ONE_SHOT).collect();
         assert!(shots.len() >= 8, "{} one-shots", shots.len());
         assert!(view.chops.iter().any(|c| c.bars == 2), "bar chops too");
@@ -1894,7 +1930,7 @@ mod tests {
         // The last shout (1.2 s), at 140 BPM: its own length, plays once.
         let i = *shots.last().unwrap();
         let chop = view.chops[i].clone();
-        shared.selection.lock().unwrap().chop = Some(ChopSel { index: i, number: shots.len(), chop: chop.clone() });
+        shared.selection.locked().chop = Some(ChopSel { index: i, number: shots.len(), chop: chop.clone() });
         let id = shared.next_request();
         shared.render(id, 140.0);
         let r = shared.current().unwrap();
@@ -1904,7 +1940,7 @@ mod tests {
         assert!((secs - 1.2).abs() < 0.1, "{secs} s");
         assert_eq!(r.file_name(), format!("shouts - one shot {}.wav", shots.len()));
         // Same stems: nothing to redo.
-        assert!(!shared.update_one_shots(&shared.selection.lock().unwrap().clone()));
+        assert!(!shared.update_one_shots(&shared.selection.locked().clone()));
     }
 
     #[test]
@@ -1954,7 +1990,7 @@ mod tests {
 
         let plugin = TempoSampler::default();
         let shared = plugin.shared.clone();
-        *shared.selection.lock().unwrap() = Selection {
+        *shared.selection.locked() = Selection {
             key: path.to_string_lossy().into(),
             path: Some(path.clone()),
             name: "song".into(),
@@ -1967,11 +2003,11 @@ mod tests {
         let id = shared.next_request();
         shared.render(id, 120.0);
         let deadline = Instant::now() + Duration::from_secs(30);
-        while shared.song_view.lock().unwrap().is_none() {
+        while shared.song_view.locked().is_none() {
             assert!(Instant::now() < deadline, "song not analysed");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let view = shared.song_view.lock().unwrap().clone().expect("song analysed");
+        let view = shared.song_view.locked().clone().expect("song analysed");
         assert!(view.chops.len() >= chops::MIN_CHOPS);
         assert_eq!(view.chop_overviews.len(), view.chops.len());
         wait_rendered(&shared, id);
@@ -1983,13 +2019,13 @@ mod tests {
 
         // Pick the first chop: rendered as an exact loop at 120 BPM.
         let chop = view.chops[0].clone();
-        shared.selection.lock().unwrap().chop = Some(ChopSel { index: 0, number: 1, chop: chop.clone() });
+        shared.selection.locked().chop = Some(ChopSel { index: 0, number: 1, chop: chop.clone() });
         let id = shared.next_request();
         shared.render(id, 120.0);
         wait_rendered(&shared, id);
         let r = shared.current().unwrap();
         assert!(r.is_loop);
-        assert_eq!(r.key, shared.selection.lock().unwrap().render_key());
+        assert_eq!(r.key, shared.selection.locked().render_key());
         assert_eq!(r.name, format!("song - {} bar chop 1", chop.bars));
         let bar_frames = 4.0 * 60.0 / 120.0 * 48_000.0;
         let bars = r.frames() as f32 / bar_frames;
@@ -2000,7 +2036,7 @@ mod tests {
         // Dragging a chop that hasn't been rendered stretches it on the spot.
         std::env::set_var("TEMPO_SAMPLER_EXPORT_DIR", dir.join("export"));
         let other = view.chops.iter().position(|c| c.bars != chop.bars || c.start != chop.start).unwrap();
-        let mut sel = shared.selection.lock().unwrap().clone();
+        let mut sel = shared.selection.locked().clone();
         sel.chop = Some(ChopSel { index: other, number: 2, chop: view.chops[other].clone() });
         let t = Instant::now();
         let path = shared.export_for_drag(&sel, 120.0).unwrap();
@@ -2045,7 +2081,7 @@ mod tests {
         let mut plugin = TempoSampler::default();
         let shared = plugin.shared.clone();
         shared.transport.tempo.store(120.0, Ordering::Relaxed);
-        *shared.selection.lock().unwrap() = Selection {
+        *shared.selection.locked() = Selection {
             key: path.to_string_lossy().into(),
             path: Some(path.clone()),
             name: "song".into(),
@@ -2065,7 +2101,7 @@ mod tests {
                 _ => std::thread::sleep(Duration::from_millis(10)),
             }
         };
-        let view = shared.song_view.lock().unwrap().clone().unwrap();
+        let view = shared.song_view.locked().clone().unwrap();
         let length = shared.chop_length.load(Ordering::Relaxed);
         let tiles: Vec<usize> = (0..view.chops.len()).filter(|&i| view.chops[i].bars == length).collect();
         assert_eq!(set.chop_indices, tiles, "pads follow tile order");
@@ -2113,7 +2149,7 @@ mod tests {
         w.finalize().unwrap();
         let wait_view = |shared: &Shared| {
             let deadline = Instant::now() + Duration::from_secs(30);
-            while shared.song_view.lock().unwrap().is_none() {
+            while shared.song_view.locked().is_none() {
                 assert!(Instant::now() < deadline, "not analysed");
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -2122,7 +2158,7 @@ mod tests {
         // Session 1: pick the song, its third chop, 4 bars, drums off.
         let first = TempoSampler::default();
         let shared = first.shared.clone();
-        *shared.selection.lock().unwrap() = Selection {
+        *shared.selection.locked() = Selection {
             key: path.to_string_lossy().into(),
             path: Some(path.clone()),
             name: "song".into(),
@@ -2133,14 +2169,14 @@ mod tests {
         let id = shared.next_request();
         shared.render(id, 120.0);
         wait_view(&shared);
-        let view = shared.song_view.lock().unwrap().clone().unwrap();
+        let view = shared.song_view.locked().clone().unwrap();
         let chop = view.chops[2].clone();
-        shared.selection.lock().unwrap().chop = Some(ChopSel { index: 2, number: 3, chop: chop.clone() });
+        shared.selection.locked().chop = Some(ChopSel { index: 2, number: 3, chop: chop.clone() });
         shared.chop_length.store(4, Ordering::Relaxed);
         shared.stem_switches.store(0b1110, Ordering::Relaxed);
         shared.want_selection();
         // What Live stores: the persisted field, serialised.
-        let saved = serde_json::to_string(&*first.params.session.lock().unwrap()).unwrap();
+        let saved = serde_json::to_string(&*first.params.session.locked()).unwrap();
 
         // Session 2: a fresh plugin, in Live's order: activated (initialize
         // with nothing loaded yet), then given the set's state (initialize
@@ -2153,21 +2189,21 @@ mod tests {
         // Don't start a stem split here: it would share the GPU with the
         // stems test running alongside (the plugin only ever runs one).
         state.is_song = false;
-        *second.params.session.lock().unwrap() = state;
+        *second.params.session.locked() = state;
         assert!(shared2.restore_if_loaded(), "state loaded after activation");
         assert!(!shared2.restore_if_loaded(), "a later initialize changes nothing");
-        assert_eq!(shared2.selection.lock().unwrap().key, path.to_string_lossy());
+        assert_eq!(shared2.selection.locked().key, path.to_string_lossy());
         assert_eq!(shared2.chop_length.load(Ordering::Relaxed), 4);
         assert_eq!(shared2.stem_switches.load(Ordering::Relaxed), 0b1110);
         let id = shared2.next_request();
         shared2.render(id, 120.0);
         wait_view(&shared2);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while shared2.selection.lock().unwrap().chop.is_none() {
+        while shared2.selection.locked().chop.is_none() {
             assert!(Instant::now() < deadline, "chop not restored");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let restored = shared2.selection.lock().unwrap().chop.clone().unwrap();
+        let restored = shared2.selection.locked().chop.clone().unwrap();
         assert_eq!((restored.index, restored.chop.start, restored.chop.end), (2, chop.start, chop.end));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2215,9 +2251,9 @@ mod tests {
             }
             drop((stereo, mono));
 
-            *shared.source.lock().unwrap() = None;
-            *shared.song_view.lock().unwrap() = None;
-            *shared.selection.lock().unwrap() = Selection {
+            *shared.source.locked() = None;
+            *shared.song_view.locked() = None;
+            *shared.selection.locked() = Selection {
                 key: path.to_string_lossy().into(),
                 path: Some(path.clone()),
                 name: name.clone(),
@@ -2229,7 +2265,7 @@ mod tests {
             let id = shared.next_request();
             shared.render(id, 120.0);
             eprintln!("select: render call returns   {}", ms(t));
-            let want = shared.selection.lock().unwrap().render_key();
+            let want = shared.selection.locked().render_key();
             while !shared.current().is_some_and(|r| r.key == want && r.bpm == 120.0) {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -2241,19 +2277,19 @@ mod tests {
             shared.render(id, 121.0);
             wait_rendered(&shared, id);
             eprintln!("re-render (tempo change)      {}", ms(t));
-            let sel = shared.selection.lock().unwrap().clone();
+            let sel = shared.selection.locked().clone();
             let t = Instant::now();
             let exported = shared.export_for_drag(&sel, 121.0);
             eprintln!("drag whole file (export)      {}  ({})", ms(t), if exported.is_ok() { "ok" } else { "failed" });
 
             if is_song {
-                while shared.song_view.lock().unwrap().is_none() {
+                while shared.song_view.locked().is_none() {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                let view = shared.song_view.lock().unwrap().clone().unwrap();
+                let view = shared.song_view.locked().clone().unwrap();
                 for (n, i) in [(1, 0usize), (2, 1)] {
                     let chop = view.chops[i].clone();
-                    shared.selection.lock().unwrap().chop = Some(ChopSel { index: i, number: n, chop });
+                    shared.selection.locked().chop = Some(ChopSel { index: i, number: n, chop });
                     let t = Instant::now();
                     let id = shared.next_request();
                     shared.render(id, 120.0);
@@ -2263,7 +2299,7 @@ mod tests {
                 let t = Instant::now();
                 shared.export_current().unwrap();
                 eprintln!("drag current chop (export)    {}", ms(t));
-                let mut sel = shared.selection.lock().unwrap().clone();
+                let mut sel = shared.selection.locked().clone();
                 sel.chop = Some(ChopSel { index: 5, number: 6, chop: view.chops[5].clone() });
                 let t = Instant::now();
                 shared.export_for_drag(&sel, 120.0).unwrap();
@@ -2275,7 +2311,7 @@ mod tests {
                         let t = Instant::now();
                         let mixed = stems::mix(&st, 0b0101, 0, st.stems[0].len() / 2);
                         eprintln!("mix 2 of 4 stems (whole song) {}  ({} samples)", ms(t), mixed.len());
-                        *shared.stems.lock().unwrap() = Some((sel.key.clone(), Arc::new(st)));
+                        *shared.stems.locked() = Some((sel.key.clone(), Arc::new(st)));
                         let t = Instant::now();
                         let o = shared.mixed_chop_overviews(0b0101);
                         eprintln!("mixed chop overviews          {}  ({:?})", ms(t), o.map(|o| o.len()));
@@ -2320,7 +2356,7 @@ mod tests {
         let shared = plugin.shared.clone();
         shared.transport.tempo.store(120.0, Ordering::Relaxed);
         let key = path.to_string_lossy().to_string();
-        *shared.selection.lock().unwrap() = Selection {
+        *shared.selection.locked() = Selection {
             key: key.clone(),
             path: Some(path.clone()),
             name: "song".into(),
@@ -2333,7 +2369,7 @@ mod tests {
         shared.request_stems(&key, &path);
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let state = shared.stem_state.lock().unwrap().1.clone();
+            let state = shared.stem_state.locked().1.clone();
             match state {
                 StemState::Ready => break,
                 StemState::Failed(e) => panic!("split failed: {e}"),
@@ -2345,11 +2381,11 @@ mod tests {
         assert!(stems::cache_dir_for(&path).unwrap().join("drums.wav").exists(), "stems cached");
 
         // Drums only, on the first chop.
-        let view = shared.song_view.lock().unwrap().clone().unwrap();
+        let view = shared.song_view.locked().clone().unwrap();
         let chop = view.chops[0].clone();
         shared.stem_switches.store(0b0001, Ordering::Relaxed);
         {
-            let mut sel = shared.selection.lock().unwrap();
+            let mut sel = shared.selection.locked();
             sel.chop = Some(ChopSel { index: 0, number: 1, chop: chop.clone() });
             sel.stem_mask = shared.effective_stem_mask(&key);
             assert_eq!(sel.stem_mask, 0b0001);
@@ -2362,7 +2398,7 @@ mod tests {
         assert!(drums.name.ends_with("(drums)"), "{}", drums.name);
 
         // Same chop, all stems: louder than drums alone (the pluck is back).
-        shared.selection.lock().unwrap().stem_mask = ALL_STEMS;
+        shared.selection.locked().stem_mask = ALL_STEMS;
         let id = shared.next_request();
         shared.render(id, 120.0);
         wait_rendered(&shared, id);

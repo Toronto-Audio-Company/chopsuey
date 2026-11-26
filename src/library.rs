@@ -5,6 +5,7 @@
 //! `~/Library/Application Support/chopsuey/library.json`, shared by every
 //! plugin instance and every Ableton set.
 
+use crate::safety::LockExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -224,7 +225,7 @@ impl Library {
     /// Loads settings from disk and scans, the first time only.
     pub fn ensure_loaded(self: &Arc<Self>) {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             if st.loaded {
                 return;
             }
@@ -238,10 +239,7 @@ impl Library {
     pub fn rescan(self: &Arc<Self>) {
         let generation = self.scan_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let lib = self.clone();
-        std::thread::Builder::new()
-            .name("tempo-sampler-scan".into())
-            .spawn(move || lib.scan(generation))
-            .ok();
+        crate::safety::spawn("tempo-sampler-scan", move || lib.scan(generation));
     }
 
     pub fn add_folders(self: &Arc<Self>, folders: Vec<PathBuf>) {
@@ -249,7 +247,7 @@ impl Library {
             return;
         }
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             for f in folders {
                 if !st.config.folders.contains(&f) {
                     st.config.folders.push(f);
@@ -262,7 +260,7 @@ impl Library {
 
     pub fn remove_folder(self: &Arc<Self>, index: usize) {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             if index < st.config.folders.len() {
                 st.config.folders.remove(index);
             }
@@ -272,12 +270,12 @@ impl Library {
     }
 
     pub fn entry(&self, key: &str) -> Option<Entry> {
-        self.state.lock().unwrap().entries.iter().find(|e| e.key == key).cloned()
+        self.state.locked().entries.iter().find(|e| e.key == key).cloned()
     }
 
     /// Stars or un-stars a sample. Saved to disk.
     pub fn toggle_favourite(&self, key: &str) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.locked();
         let on = !st.config.favourites.remove(key);
         if on {
             st.config.favourites.insert(key.to_string());
@@ -295,7 +293,7 @@ impl Library {
         if key == BUILTIN_KEY {
             return;
         }
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.locked();
         st.config.overrides.remove(key);
         if scale == 1.0 {
             st.config.tempo_scale.remove(key);
@@ -319,7 +317,7 @@ impl Library {
         let timing = std::env::var_os("TEMPO_SAMPLER_TIMING").is_some();
         let t0 = Instant::now();
         let config = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             st.scanning = true;
             self.busy.store(true, Ordering::Relaxed);
             self.detecting.store(0, Ordering::Relaxed);
@@ -330,13 +328,13 @@ impl Library {
         // Pass 0: on first open, show last session's list straight from the
         // scan cache (no disk or network access), while the real scan runs.
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             if st.entries.len() <= 1 && !config.scan_cache.is_empty() {
                 st.entries = cached_entries(&config);
                 drop(st);
                 self.bump();
                 if timing {
-                    eprintln!("library: cached list shown after {:?}", t0.elapsed());
+                    crate::logln!("library: cached list shown after {:?}", t0.elapsed());
                 }
             }
         }
@@ -349,7 +347,7 @@ impl Library {
             walk(folder, 0, &mut files);
         }
         if timing {
-            eprintln!("library: listed {} files after {:?}", files.len(), t0.elapsed());
+            crate::logln!("library: listed {} files after {:?}", files.len(), t0.elapsed());
         }
         let scanned = parallel_map(&files, PROBE_THREADS, |path| {
             if self.cancelled(generation) {
@@ -389,7 +387,7 @@ impl Library {
             })
             .collect();
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             // Checked under the lock so a stale scan can't overwrite a newer one.
             if self.cancelled(generation) {
                 return;
@@ -400,7 +398,7 @@ impl Library {
         }
         self.bump();
         if timing {
-            eprintln!("library: scanned list shown after {:?} ({} to detect)", t0.elapsed(), pending.len());
+            crate::logln!("library: scanned list shown after {:?} ({} to detect)", t0.elapsed(), pending.len());
         }
 
         // Pass 2: analyse files that have no tempo in their name, a few at a
@@ -420,7 +418,7 @@ impl Library {
                 _ => false,
             };
             let bpm = if from_name { *hint } else { detected };
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             let scale = scale_for(&st.config, key, bpm);
             if let Some(e) = st.entries.iter_mut().find(|e| &e.key == key) {
                 // A tempo from the name stays; only a missing one is filled in.
@@ -456,7 +454,7 @@ impl Library {
             }
             drop(st);
             self.detecting.fetch_sub(1, Ordering::Relaxed);
-            let mut last = last_bump.lock().unwrap();
+            let mut last = last_bump.locked();
             if last.elapsed() > Duration::from_millis(250) {
                 self.bump();
                 *last = Instant::now();
@@ -464,7 +462,7 @@ impl Library {
             None
         });
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.locked();
         if self.cancelled(generation) {
             return;
         }
@@ -475,7 +473,7 @@ impl Library {
         drop(st);
         self.bump();
         if timing {
-            eprintln!("library: tempos done after {:?}", t0.elapsed());
+            crate::logln!("library: tempos done after {:?}", t0.elapsed());
         }
     }
 }
@@ -556,12 +554,12 @@ pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], threads: usize, f: imp
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(item) = items.get(i) else { break };
                 if let Some(r) = f(item) {
-                    out.lock().unwrap().push((i, r));
+                    out.locked().push((i, r));
                 }
             });
         }
     });
-    let mut out = out.into_inner().unwrap();
+    let mut out = out.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     out.sort_by_key(|(i, _)| *i);
     out.into_iter().map(|(_, r)| r).collect()
 }
@@ -695,7 +693,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             {
-                let st = lib.state.lock().unwrap();
+                let st = lib.state.locked();
                 let done = st.entries.len() == 4
                     && !st.scanning
                     && st.entries.iter().all(|e| e.source != BpmSource::Pending);
@@ -707,7 +705,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let get = |name: &str| lib.state.lock().unwrap().entries.iter().find(|e| e.name == name).cloned().unwrap();
+        let get = |name: &str| lib.state.locked().entries.iter().find(|e| e.name == name).cloned().unwrap();
         let e = get("Drums 124bpm");
         assert_eq!((e.bpm, e.source), (Some(124.0), BpmSource::FileName));
         let e = get("loop_140_Cmin");

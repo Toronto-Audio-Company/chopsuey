@@ -1,3 +1,4 @@
+use crate::safety::LockExt;
 use nih_plug::prelude::{AsyncExecutor, Editor, GuiContext, ParentWindowHandle};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::icons::{
@@ -192,7 +193,7 @@ impl AppData {
 
     fn rebuild_rows(&mut self) {
         let needle = self.search.trim().to_lowercase();
-        let st = self.shared.library.state.lock().unwrap();
+        let st = self.shared.library.state.locked();
         // Search: every word must match the name, folder or key ("am",
         // "f#m"); "90-100" keeps tempos in that range. The Favourites
         // filter keeps starred samples only.
@@ -384,7 +385,7 @@ impl AppData {
             self.message = format!("{}: longer than {mins:.0} minutes, too long to stretch", entry.name);
             return;
         }
-        *self.shared.selection.lock().unwrap() = Selection {
+        *self.shared.selection.locked() = Selection {
             key: entry.key.clone(),
             path: entry.path.clone(),
             name: entry.name.clone(),
@@ -410,205 +411,207 @@ impl AppData {
 
 impl Model for AppData {
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-        event.map(|e, _| match e {
-            AppEvent::ToggleStem(i) => {
-                let key = self.shared.selection.lock().unwrap().key.clone();
-                if self.shared.stems_for(&key).is_none() {
-                    self.message = "Stems are still being split".into();
-                    return;
-                }
-                let switches = self.shared.stem_switches.load(Ordering::Relaxed) ^ (1 << i);
-                if switches == 0 {
-                    self.message = "Keep at least one stem on".into();
-                    return;
-                }
-                self.shared.stem_switches.store(switches, Ordering::Relaxed);
-                self.shared.selection.lock().unwrap().stem_mask = switches;
-                self.message.clear();
-                self.request_render();
-                let p = &self.params;
-                let param = [&p.drums, &p.bass, &p.other, &p.vocals][*i];
-                set_param(cx, param, switches & (1 << i) != 0);
-            }
-            AppEvent::SetChopLength(bars) => {
-                self.shared.chop_length.store(*bars, Ordering::Relaxed);
-                set_param(cx, &self.params.chop_length, ChopLength::from_bars(*bars));
-                self.shared.refresh_pads(); // pads play the tiles shown
-                self.shared.save_session();
-            }
-            AppEvent::SelectChop(index) => {
-                self.press_selected = false;
-                let Some(view) = self.shared.song_view.lock().unwrap().clone() else { return };
-                let Some(chop) = view.chops.get(*index).cloned() else { return };
-                let number = chop_number(&view.chops, *index);
-                {
-                    let mut sel = self.shared.selection.lock().unwrap();
-                    if sel.key != view.key {
+        crate::safety::guard("ui event", || {
+            event.map(|e, _| match e {
+                AppEvent::ToggleStem(i) => {
+                    let key = self.shared.selection.locked().key.clone();
+                    if self.shared.stems_for(&key).is_none() {
+                        self.message = "Stems are still being split".into();
                         return;
                     }
-                    sel.chop = Some(ChopSel { index: *index, number, chop: chop.clone() });
-                }
-                self.selected_chop = *index as i64;
-                self.message.clear();
-                self.request_render();
-                self.mark_set_changed(cx);
-                self.shared.preview.store(true, Ordering::Relaxed);
-                self.press_selected = true;
-            }
-            AppEvent::WholeSong => {
-                self.shared.selection.lock().unwrap().chop = None;
-                self.selected_chop = -1;
-                self.message.clear();
-                self.request_render();
-                self.mark_set_changed(cx);
-                self.shared.preview.store(true, Ordering::Relaxed);
-                self.press_selected = true;
-            }
-            AppEvent::RefreshRows => {
-                // Development: TEMPO_SAMPLER_DEMO_SEARCH=<text> prefills the search once.
-                static DEMO_SEARCH_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if let Ok(text) = std::env::var("TEMPO_SAMPLER_DEMO_SEARCH") {
-                    if !DEMO_SEARCH_DONE.swap(true, Ordering::Relaxed) {
-                        self.search = text;
+                    let switches = self.shared.stem_switches.load(Ordering::Relaxed) ^ (1 << i);
+                    if switches == 0 {
+                        self.message = "Keep at least one stem on".into();
+                        return;
                     }
+                    self.shared.stem_switches.store(switches, Ordering::Relaxed);
+                    self.shared.selection.locked().stem_mask = switches;
+                    self.message.clear();
+                    self.request_render();
+                    let p = &self.params;
+                    let param = [&p.drums, &p.bass, &p.other, &p.vocals][*i];
+                    set_param(cx, param, switches & (1 << i) != 0);
                 }
-                self.rebuild_rows();
-                // Development: TEMPO_SAMPLER_DEMO=<name> selects that entry once it appears.
-                if self.selected_key == crate::library::BUILTIN_KEY {
-                    if let Some(want) = std::env::var_os("TEMPO_SAMPLER_DEMO") {
-                        let want = want.to_string_lossy().to_lowercase();
-                        let key = {
-                            let st = self.shared.library.state.lock().unwrap();
-                            st.entries.iter().find(|e| e.usable() && e.name.to_lowercase().contains(&want)).map(|e| e.key.clone())
-                        };
-                        if let Some(key) = key {
-                            self.select_key(&key);
-                            self.shared.preview.store(true, Ordering::Relaxed);
-                        }
-                    }
+                AppEvent::SetChopLength(bars) => {
+                    self.shared.chop_length.store(*bars, Ordering::Relaxed);
+                    set_param(cx, &self.params.chop_length, ChopLength::from_bars(*bars));
+                    self.shared.refresh_pads(); // pads play the tiles shown
+                    self.shared.save_session();
                 }
-            }
-            AppEvent::Search(text) => {
-                self.search = text.clone();
-                self.list_to_top = true;
-                self.rebuild_rows();
-            }
-            AppEvent::ListScrolled { y, view_h, scroll } => {
-                self.list_scroll_y = *y;
-                self.list_view_h = *view_h;
-                self.list_scroll = Some(*scroll);
-                let slots = (*view_h / ROW_HEIGHT).ceil() as usize + 1;
-                if slots != self.list_slots {
-                    self.list_slots = slots;
-                }
-            }
-            AppEvent::SelectSlot(slot) => {
-                let Some(row) = self.slot_row(*slot) else { return };
-                let key = row.key.clone();
-                if row.is_folder {
-                    // Open or close the folder; never a drag source.
+                AppEvent::SelectChop(index) => {
                     self.press_selected = false;
-                    if !self.search.trim().is_empty() {
-                        return; // while searching, matching folders stay open
+                    let Some(view) = self.shared.song_view.locked().clone() else { return };
+                    let Some(chop) = view.chops.get(*index).cloned() else { return };
+                    let number = chop_number(&view.chops, *index);
+                    {
+                        let mut sel = self.shared.selection.locked();
+                        if sel.key != view.key {
+                            return;
+                        }
+                        sel.chop = Some(ChopSel { index: *index, number, chop: chop.clone() });
                     }
-                    if !self.toggled_folders.remove(&key) {
-                        self.toggled_folders.insert(key);
+                    self.selected_chop = *index as i64;
+                    self.message.clear();
+                    self.request_render();
+                    self.mark_set_changed(cx);
+                    self.shared.preview.store(true, Ordering::Relaxed);
+                    self.press_selected = true;
+                }
+                AppEvent::WholeSong => {
+                    self.shared.selection.locked().chop = None;
+                    self.selected_chop = -1;
+                    self.message.clear();
+                    self.request_render();
+                    self.mark_set_changed(cx);
+                    self.shared.preview.store(true, Ordering::Relaxed);
+                    self.press_selected = true;
+                }
+                AppEvent::RefreshRows => {
+                    // Development: TEMPO_SAMPLER_DEMO_SEARCH=<text> prefills the search once.
+                    static DEMO_SEARCH_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if let Ok(text) = std::env::var("TEMPO_SAMPLER_DEMO_SEARCH") {
+                        if !DEMO_SEARCH_DONE.swap(true, Ordering::Relaxed) {
+                            self.search = text;
+                        }
                     }
                     self.rebuild_rows();
-                } else {
-                    self.select_key(&key);
-                    self.mark_set_changed(cx);
-                    // Held down: audition it, like a sample browser.
-                    if self.press_selected {
-                        self.shared.preview.store(true, Ordering::Relaxed);
-                    }
-                    // The tempo parameter shows this file's ½× / 1× / 2×.
-                    if let Some(e) = self.shared.library.entry(&key) {
-                        let scale = TempoScale::from_factor(e.scale);
-                        if self.params.tempo_scale.value() != scale {
-                            set_param(cx, &self.params.tempo_scale, scale);
+                    // Development: TEMPO_SAMPLER_DEMO=<name> selects that entry once it appears.
+                    if self.selected_key == crate::library::BUILTIN_KEY {
+                        if let Some(want) = std::env::var_os("TEMPO_SAMPLER_DEMO") {
+                            let want = want.to_string_lossy().to_lowercase();
+                            let key = {
+                                let st = self.shared.library.state.locked();
+                                st.entries.iter().find(|e| e.usable() && e.name.to_lowercase().contains(&want)).map(|e| e.key.clone())
+                            };
+                            if let Some(key) = key {
+                                self.select_key(&key);
+                                self.shared.preview.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
-            }
-            AppEvent::SetTempoScale(scale) => {
-                let key = self.selected_key.clone();
-                if key == BUILTIN_KEY {
-                    self.message = "The built-in loop's tempo is fixed".into();
-                    return;
+                AppEvent::Search(text) => {
+                    self.search = text.clone();
+                    self.list_to_top = true;
+                    self.rebuild_rows();
                 }
-                if self.shared.library.entry(&key).is_some_and(|e| e.base_bpm.is_some() && e.scale != *scale) {
-                    self.shared.library.set_scale(&key, *scale);
-                    self.select_key(&key);
-                    set_param(cx, &self.params.tempo_scale, TempoScale::from_factor(*scale));
-                }
-            }
-            AppEvent::AddFolder => {
-                // The picker returns immediately; folders arrive in the callback.
-                let library = self.shared.library.clone();
-                match dialog::pick_folders(move |folders| library.add_folders(folders)) {
-                    Ok(()) => self.show_folders = true,
-                    Err(e) => self.message = e,
-                }
-            }
-            AppEvent::RemoveFolder(index) => self.shared.library.remove_folder(*index),
-            AppEvent::ToggleFolders => self.show_folders = !self.show_folders,
-            AppEvent::Rescan => self.shared.library.rescan(),
-            AppEvent::ToggleFavourite => {
-                if self.selected_key != BUILTIN_KEY {
-                    self.shared.library.toggle_favourite(&self.selected_key);
-                }
-            }
-            AppEvent::ToggleFavouritesOnly => {
-                self.favourites_only = !self.favourites_only;
-                self.list_to_top = true;
-                self.rebuild_rows();
-            }
-            AppEvent::StopPreview => {
-                self.shared.preview.store(false, Ordering::Relaxed);
-            }
-            AppEvent::HoverSlot(slot) => {
-                if let Some(row) = self.slot_row(*slot) {
-                    self.hover = Some((row.key.clone(), std::time::Instant::now()));
-                    self.hover_slot = Some(*slot);
-                }
-            }
-            AppEvent::UnhoverSlot(slot) => {
-                // Leaving one row can arrive after entering the next.
-                if self.hover_slot == Some(*slot) {
-                    self.hover = None;
-                    self.hover_slot = None;
-                }
-            }
-            AppEvent::Audition => {
-                self.message.clear();
-                self.shared.preview.store(true, Ordering::Relaxed);
-                self.press_selected = true;
-            }
-            AppEvent::StartDrag => {
-                // The OS takes the mouse from here, so the release never arrives.
-                self.shared.preview.store(false, Ordering::Relaxed);
-                if !self.press_selected {
-                    return; // the press didn't select anything draggable
-                }
-                let result = self.shared.export_current().and_then(|path| {
-                    drag::start_file_drag(self.parent_view.load(Ordering::Acquire), &path)
-                });
-                if let Err(e) = result {
-                    self.message = format!("Drag failed: {e}");
-                }
-            }
-            AppEvent::ShowInFinder => {
-                self.message = match self.shared.export_current() {
-                    Ok(path) => {
-                        let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
-                        format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy())
+                AppEvent::ListScrolled { y, view_h, scroll } => {
+                    self.list_scroll_y = *y;
+                    self.list_view_h = *view_h;
+                    self.list_scroll = Some(*scroll);
+                    let slots = (*view_h / ROW_HEIGHT).ceil() as usize + 1;
+                    if slots != self.list_slots {
+                        self.list_slots = slots;
                     }
-                    Err(e) => format!("Export failed: {e}"),
-                };
-            }
+                }
+                AppEvent::SelectSlot(slot) => {
+                    let Some(row) = self.slot_row(*slot) else { return };
+                    let key = row.key.clone();
+                    if row.is_folder {
+                        // Open or close the folder; never a drag source.
+                        self.press_selected = false;
+                        if !self.search.trim().is_empty() {
+                            return; // while searching, matching folders stay open
+                        }
+                        if !self.toggled_folders.remove(&key) {
+                            self.toggled_folders.insert(key);
+                        }
+                        self.rebuild_rows();
+                    } else {
+                        self.select_key(&key);
+                        self.mark_set_changed(cx);
+                        // Held down: audition it, like a sample browser.
+                        if self.press_selected {
+                            self.shared.preview.store(true, Ordering::Relaxed);
+                        }
+                        // The tempo parameter shows this file's ½× / 1× / 2×.
+                        if let Some(e) = self.shared.library.entry(&key) {
+                            let scale = TempoScale::from_factor(e.scale);
+                            if self.params.tempo_scale.value() != scale {
+                                set_param(cx, &self.params.tempo_scale, scale);
+                            }
+                        }
+                    }
+                }
+                AppEvent::SetTempoScale(scale) => {
+                    let key = self.selected_key.clone();
+                    if key == BUILTIN_KEY {
+                        self.message = "The built-in loop's tempo is fixed".into();
+                        return;
+                    }
+                    if self.shared.library.entry(&key).is_some_and(|e| e.base_bpm.is_some() && e.scale != *scale) {
+                        self.shared.library.set_scale(&key, *scale);
+                        self.select_key(&key);
+                        set_param(cx, &self.params.tempo_scale, TempoScale::from_factor(*scale));
+                    }
+                }
+                AppEvent::AddFolder => {
+                    // The picker returns immediately; folders arrive in the callback.
+                    let library = self.shared.library.clone();
+                    match dialog::pick_folders(move |folders| library.add_folders(folders)) {
+                        Ok(()) => self.show_folders = true,
+                        Err(e) => self.message = e,
+                    }
+                }
+                AppEvent::RemoveFolder(index) => self.shared.library.remove_folder(*index),
+                AppEvent::ToggleFolders => self.show_folders = !self.show_folders,
+                AppEvent::Rescan => self.shared.library.rescan(),
+                AppEvent::ToggleFavourite => {
+                    if self.selected_key != BUILTIN_KEY {
+                        self.shared.library.toggle_favourite(&self.selected_key);
+                    }
+                }
+                AppEvent::ToggleFavouritesOnly => {
+                    self.favourites_only = !self.favourites_only;
+                    self.list_to_top = true;
+                    self.rebuild_rows();
+                }
+                AppEvent::StopPreview => {
+                    self.shared.preview.store(false, Ordering::Relaxed);
+                }
+                AppEvent::HoverSlot(slot) => {
+                    if let Some(row) = self.slot_row(*slot) {
+                        self.hover = Some((row.key.clone(), std::time::Instant::now()));
+                        self.hover_slot = Some(*slot);
+                    }
+                }
+                AppEvent::UnhoverSlot(slot) => {
+                    // Leaving one row can arrive after entering the next.
+                    if self.hover_slot == Some(*slot) {
+                        self.hover = None;
+                        self.hover_slot = None;
+                    }
+                }
+                AppEvent::Audition => {
+                    self.message.clear();
+                    self.shared.preview.store(true, Ordering::Relaxed);
+                    self.press_selected = true;
+                }
+                AppEvent::StartDrag => {
+                    // The OS takes the mouse from here, so the release never arrives.
+                    self.shared.preview.store(false, Ordering::Relaxed);
+                    if !self.press_selected {
+                        return; // the press didn't select anything draggable
+                    }
+                    let result = self.shared.export_current().and_then(|path| {
+                        drag::start_file_drag(self.parent_view.load(Ordering::Acquire), &path)
+                    });
+                    if let Err(e) = result {
+                        self.message = format!("Drag failed: {e}");
+                    }
+                }
+                AppEvent::ShowInFinder => {
+                    self.message = match self.shared.export_current() {
+                        Ok(path) => {
+                            let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+                            format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy())
+                        }
+                        Err(e) => format!("Export failed: {e}"),
+                    };
+                }
+            });
+            self.keep_list_position(cx);
         });
-        self.keep_list_position(cx);
     }
 }
 
@@ -689,7 +692,7 @@ fn format_duration(secs: f32) -> String {
 /// Something worth saying about the preview: an error, or that it's still
 /// stretching. Nothing once it's playing.
 fn render_status(s: &Shared) -> Option<String> {
-    if let Some(e) = s.render_error.lock().unwrap().as_ref() {
+    if let Some(e) = s.render_error.locked().as_ref() {
         return Some(e.clone());
     }
     let ready = s.current().is_some() && s.is_up_to_date() && s.rendered_bpm.load(Ordering::Relaxed) > 0.0;
@@ -735,7 +738,7 @@ pub(crate) fn create(
         if let Some(bars) = std::env::var("TEMPO_SAMPLER_DEMO_LENGTH").ok().and_then(|b| b.parse::<usize>().ok()) {
             shared.chop_length.store(bars, Ordering::Relaxed);
         }
-        let selected_key = shared.selection.lock().unwrap().key.clone();
+        let selected_key = shared.selection.locked().key.clone();
         AppData {
             shared: shared.clone(),
             params: params.clone(),
@@ -769,7 +772,7 @@ pub(crate) fn create(
             sample_count: 0,
             message: String::new(),
             // A chop restored from the Live set shows as selected.
-            selected_chop: shared.selection.lock().unwrap().chop.as_ref().map_or(-1, |c| c.index as i64),
+            selected_chop: shared.selection.locked().chop.as_ref().map_or(-1, |c| c.index as i64),
             press_selected: true,
         }
         .build(cx);
@@ -792,7 +795,7 @@ pub(crate) fn create(
 
         ResizeHandle::new(cx);
         if std::env::var_os("TEMPO_SAMPLER_TIMING").is_some() {
-            eprintln!("editor: built in {:?}", t0.elapsed());
+            crate::logln!("editor: built in {:?}", t0.elapsed());
         }
     })?;
 
@@ -1349,56 +1352,58 @@ impl View for PitchBox {
     }
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-        use nih_plug_vizia::widgets::ParamEvent;
-        let params = self.params.clone();
-        let param = (self.param)(&params);
-        let (min, max) = match param.range() {
-            IntRange::Linear { min, max } => (min, max),
-            _ => (i32::MIN, i32::MAX),
-        };
-        event.map(|window_event, meta| match window_event {
-            WindowEvent::MouseDown(MouseButton::Left) => {
-                cx.emit(ParamEvent::BeginSetParameter(param).upcast());
-                self.drag = Some((cx.mouse().cursory, param.value()));
-                cx.capture();
-                meta.consume();
-            }
-            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
-                // Back to 0; a drag that carries on starts from there.
-                self.set(cx, 0);
-                if self.drag.is_some() {
-                    self.drag = Some((cx.mouse().cursory, 0));
+        crate::safety::guard("ui event", || {
+            use nih_plug_vizia::widgets::ParamEvent;
+            let params = self.params.clone();
+            let param = (self.param)(&params);
+            let (min, max) = match param.range() {
+                IntRange::Linear { min, max } => (min, max),
+                _ => (i32::MIN, i32::MAX),
+            };
+            event.map(|window_event, meta| match window_event {
+                WindowEvent::MouseDown(MouseButton::Left) => {
+                    cx.emit(ParamEvent::BeginSetParameter(param).upcast());
+                    self.drag = Some((cx.mouse().cursory, param.value()));
+                    cx.capture();
+                    meta.consume();
                 }
-                meta.consume();
-            }
-            WindowEvent::MouseMove(_, y) => {
-                if let Some((origin, start)) = self.drag {
-                    let steps = ((origin - y) / (self.px_per_step * cx.scale_factor())).trunc() as i32;
-                    let value = (start + steps).clamp(min, max);
-                    if value != param.value() {
-                        self.set(cx, value);
+                WindowEvent::MouseDoubleClick(MouseButton::Left) => {
+                    // Back to 0; a drag that carries on starts from there.
+                    self.set(cx, 0);
+                    if self.drag.is_some() {
+                        self.drag = Some((cx.mouse().cursory, 0));
+                    }
+                    meta.consume();
+                }
+                WindowEvent::MouseMove(_, y) => {
+                    if let Some((origin, start)) = self.drag {
+                        let steps = ((origin - y) / (self.px_per_step * cx.scale_factor())).trunc() as i32;
+                        let value = (start + steps).clamp(min, max);
+                        if value != param.value() {
+                            self.set(cx, value);
+                        }
                     }
                 }
-            }
-            WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
-                self.drag = None;
-                cx.release();
-                cx.emit(ParamEvent::EndSetParameter(param).upcast());
-                meta.consume();
-            }
-            WindowEvent::MouseScroll(_, y) => {
-                self.scroll += y;
-                let steps = self.scroll.trunc();
-                if steps != 0.0 {
-                    self.scroll -= steps;
-                    let value = (param.value() + steps as i32).clamp(min, max);
-                    if value != param.value() {
-                        self.set(cx, value);
-                    }
+                WindowEvent::MouseUp(MouseButton::Left) if self.drag.is_some() => {
+                    self.drag = None;
+                    cx.release();
+                    cx.emit(ParamEvent::EndSetParameter(param).upcast());
+                    meta.consume();
                 }
-                meta.consume();
-            }
-            _ => {}
+                WindowEvent::MouseScroll(_, y) => {
+                    self.scroll += y;
+                    let steps = self.scroll.trunc();
+                    if steps != 0.0 {
+                        self.scroll -= steps;
+                        let value = (param.value() + steps as i32).clamp(min, max);
+                        if value != param.value() {
+                            self.set(cx, value);
+                        }
+                    }
+                    meta.consume();
+                }
+                _ => {}
+            });
         });
     }
 }
@@ -1420,8 +1425,8 @@ fn show_in_finder(cx: &mut Context) {
 fn song_cards(cx: &mut Context) {
     // -1: not a song (or not analysed yet); otherwise the analysis version.
     let song_version = AppData::shared.map(|s| {
-        let key = s.selection.lock().unwrap().key.clone();
-        let has = s.song_view.lock().unwrap().as_ref().is_some_and(|v| v.key == key);
+        let key = s.selection.locked().key.clone();
+        let has = s.song_view.locked().as_ref().is_some_and(|v| v.key == key);
         if has {
             s.song_view_version.load(Ordering::Relaxed) as i64
         } else {
@@ -1444,7 +1449,7 @@ fn song_cards(cx: &mut Context) {
                 return;
             }
             let shared = AppData::shared.get(cx);
-            let Some(view) = shared.song_view.lock().unwrap().clone() else { return };
+            let Some(view) = shared.song_view.locked().clone() else { return };
             // Development: TEMPO_SAMPLER_DEMO_CHOP=<n> selects tile n (1-based) of
             // the current length once.
             static DEMO_CHOP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1472,8 +1477,8 @@ fn stems_card(cx: &mut Context) {
                 cx,
                 // Progress while splitting; nothing once ready.
                 AppData::shared.map(|s| {
-                    let key = s.selection.lock().unwrap().key.clone();
-                    let (k, st) = s.stem_state.lock().unwrap().clone();
+                    let key = s.selection.locked().key.clone();
+                    let (k, st) = s.stem_state.locked().clone();
                     match st {
                         _ if k != key => String::new(),
                         StemState::Loading => "Loading…".into(),
@@ -1493,7 +1498,7 @@ fn stems_card(cx: &mut Context) {
         HStack::new(cx, |cx| {
             // One lookup shared by the four buttons (lenses run every frame).
             let ready = AppData::shared.map(|s| {
-                let sel = s.selection.lock().unwrap();
+                let sel = s.selection.locked();
                 s.stems_for(&sel.key).is_some()
             });
             for (i, name) in STEM_NAMES.iter().enumerate() {
@@ -1670,7 +1675,7 @@ impl View for LoopWave {
         if b.w <= 1.0 || b.h <= 1.0 {
             return;
         }
-        let key = self.shared.selection.lock().unwrap().key.clone();
+        let key = self.shared.selection.locked().key.clone();
         let Some((rendered, overview)) = self.shared.current_with_overview() else { return };
         if rendered.key != key || overview.is_empty() {
             return; // still stretching this one
@@ -1829,10 +1834,10 @@ impl View for ChopWave {
         if b.w <= 1.0 || b.h <= 1.0 {
             return;
         }
-        let Some(view) = self.shared.song_view.lock().unwrap().clone() else { return };
+        let Some(view) = self.shared.song_view.locked().clone() else { return };
         // With some stems off, show the waveform of what's actually playing.
         let (mask, selected) = {
-            let sel = self.shared.selection.lock().unwrap();
+            let sel = self.shared.selection.locked();
             (sel.stem_mask, sel.chop.as_ref().map(|c| c.index))
         };
         let mixed = if mask != ALL_STEMS { self.shared.mixed_chop_overviews(mask) } else { None };
@@ -1896,27 +1901,29 @@ struct Hold {
 
 impl Hold {
     fn event(&mut self, cx: &mut EventContext, event: &mut Event, on_press: AppEvent) {
-        event.map(|window_event, meta| match window_event {
-            WindowEvent::MouseDown(MouseButton::Left) => {
-                cx.emit(on_press.clone());
-                self.armed = true;
-                self.origin = (cx.mouse().cursorx, cx.mouse().cursory);
-                cx.capture();
-                meta.consume();
-            }
-            WindowEvent::MouseMove(x, y) if self.armed => {
-                if (x - self.origin.0).hypot(y - self.origin.1) > 4.0 {
+        crate::safety::guard("ui event", || {
+            event.map(|window_event, meta| match window_event {
+                WindowEvent::MouseDown(MouseButton::Left) => {
+                    cx.emit(on_press.clone());
+                    self.armed = true;
+                    self.origin = (cx.mouse().cursorx, cx.mouse().cursory);
+                    cx.capture();
+                    meta.consume();
+                }
+                WindowEvent::MouseMove(x, y) if self.armed => {
+                    if (x - self.origin.0).hypot(y - self.origin.1) > 4.0 {
+                        self.armed = false;
+                        cx.release();
+                        cx.emit(AppEvent::StartDrag);
+                    }
+                }
+                WindowEvent::MouseUp(MouseButton::Left) if self.armed => {
                     self.armed = false;
                     cx.release();
-                    cx.emit(AppEvent::StartDrag);
+                    cx.emit(AppEvent::StopPreview);
                 }
-            }
-            WindowEvent::MouseUp(MouseButton::Left) if self.armed => {
-                self.armed = false;
-                cx.release();
-                cx.emit(AppEvent::StopPreview);
-            }
-            _ => {}
+                _ => {}
+            });
         });
     }
 }
@@ -1927,14 +1934,16 @@ impl View for PressDrag {
     }
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
-        if let AppEvent::SelectSlot(slot) = self.on_press {
-            event.map(|window_event, _| match window_event {
-                WindowEvent::MouseEnter => cx.emit(AppEvent::HoverSlot(slot)),
-                WindowEvent::MouseLeave => cx.emit(AppEvent::UnhoverSlot(slot)),
-                _ => {}
-            });
-        }
-        self.hold.event(cx, event, self.on_press.clone());
+        crate::safety::guard("ui event", || {
+            if let AppEvent::SelectSlot(slot) = self.on_press {
+                event.map(|window_event, _| match window_event {
+                    WindowEvent::MouseEnter => cx.emit(AppEvent::HoverSlot(slot)),
+                    WindowEvent::MouseLeave => cx.emit(AppEvent::UnhoverSlot(slot)),
+                    _ => {}
+                });
+            }
+            self.hold.event(cx, event, self.on_press.clone());
+        });
     }
 }
 

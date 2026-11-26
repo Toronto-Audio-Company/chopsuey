@@ -1,5 +1,6 @@
 //! Shared spectral analysis.
 
+use crate::safety::LockExt;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// 10 ms analysis hop.
@@ -66,7 +67,8 @@ pub fn stft_log_mags(mono: &[f32], sample_rate: u32, hop: usize, mut per_frame: 
                 })
             })
             .collect();
-        jobs.into_iter().map(|j| j.join().expect("STFT worker")).collect()
+        // A worker that panicked contributes nothing; the panic was logged.
+        jobs.into_iter().map(|j| j.join().unwrap_or_default()).collect()
     });
     let mut f = 0;
     for out in &results {
@@ -166,7 +168,7 @@ fn sinc_table(from: u32, to: u32) -> (isize, std::sync::Arc<Vec<f32>>) {
     use std::sync::{Arc, Mutex, OnceLock};
     static TABLES: OnceLock<Mutex<HashMap<(u32, u32), (isize, Arc<Vec<f32>>)>>> = OnceLock::new();
     let tables = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(t) = tables.lock().unwrap().get(&(from, to)) {
+    if let Some(t) = tables.locked().get(&(from, to)) {
         return t.clone();
     }
     let ratio = to as f64 / from as f64;
@@ -199,7 +201,7 @@ fn sinc_table(from: u32, to: u32) -> (isize, std::sync::Arc<Vec<f32>>) {
         }
     }
     let entry = (half, Arc::new(table));
-    tables.lock().unwrap().insert((from, to), entry.clone());
+    tables.locked().insert((from, to), entry.clone());
     entry
 }
 
