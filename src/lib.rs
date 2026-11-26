@@ -249,6 +249,9 @@ pub struct Shared {
     pub pads_down: AtomicU64,
     /// Saved with the Live set (the same Arc as the persisted param field).
     pub session: Arc<Mutex<SessionState>>,
+    /// The session state currently in effect (last restored or saved). When
+    /// `session` differs, the host has loaded new state that needs applying.
+    applied_session: Mutex<SessionState>,
     /// A chop to re-select once the restored song has been analysed.
     restore_chop: Mutex<Option<(String, usize, usize)>>,
     /// Gain that plays the selected sample at a matched loudness (1.0 if
@@ -463,6 +466,7 @@ impl Shared {
         let analysed = self.song_view.lock().unwrap().as_ref().is_some_and(|v| v.key == sel.key);
         let mut session = self.session.lock().unwrap();
         let is_song = analysed || (session.is_song && session.key == sel.key);
+        let mut applied = self.applied_session.lock().unwrap();
         *session = SessionState {
             is_song,
             chop: sel.chop.as_ref().map(|c| (c.chop.start, c.chop.end)),
@@ -473,18 +477,30 @@ impl Shared {
             chop_length: self.chop_length.load(Ordering::Relaxed),
             stem_switches: self.stem_switches.load(Ordering::Relaxed),
         };
+        *applied = session.clone();
+    }
+
+    /// Restores the session if the host loaded state that isn't in effect
+    /// yet. True if it did (the selection changed, so re-render).
+    fn restore_if_loaded(self: &Arc<Self>) -> bool {
+        let saved = self.session.lock().unwrap().clone();
+        if *self.applied_session.lock().unwrap() == saved {
+            return false;
+        }
+        *self.applied_session.lock().unwrap() = saved;
+        self.restore_session()
     }
 
     /// Puts back what the Live set saved (called when the plugin starts;
     /// the audio thread then renders it once it knows the tempo, and the
     /// chop comes back after the song is analysed).
-    fn restore_session(self: &Arc<Self>) {
+    fn restore_session(self: &Arc<Self>) -> bool {
         let saved = self.session.lock().unwrap().clone();
         if saved.key.is_empty() || saved.bpm <= 0.0 {
-            return;
+            return false;
         }
         if saved.path.as_ref().is_some_and(|p| !p.exists()) {
-            return; // the file has moved since
+            return false; // the file has moved since
         }
         if saved.chop_length > 0 {
             self.chop_length.store(saved.chop_length, Ordering::Relaxed);
@@ -510,6 +526,7 @@ impl Shared {
         }
         let key = self.selection.lock().unwrap().render_key();
         self.wanted_key.store(loops::key_hash(&key), Ordering::Relaxed);
+        true
     }
 
     pub fn next_request(&self) -> u64 {
@@ -1159,8 +1176,6 @@ pub struct TempoSampler {
     voices: [Option<Voice>; MAX_VOICES],
     /// Slot of the most recent hit, for the playhead.
     last_voice: usize,
-    /// The Live set's saved state has been applied.
-    restored: bool,
     /// Parameter values last handed to `apply_params`.
     applied_params: ParamValues,
 }
@@ -1204,6 +1219,12 @@ pub struct TempoSamplerParams {
     pub transpose: IntParam,
     #[id = "detune"]
     pub detune: IntParam,
+    /// Flipped by the GUI whenever a file or chop is picked. It does nothing
+    /// itself: the pick lives in `session`, which Live doesn't watch, so
+    /// without a parameter change Live wouldn't know the set changed and
+    /// could quit without offering to save it.
+    #[id = "picked"]
+    pub picked: BoolParam,
 }
 
 /// "+3", "-12", "0": how Ableton shows Transpose and Detune.
@@ -1339,6 +1360,7 @@ impl Default for TempoSampler {
             detune: AtomicI32::new(0),
             preview_gain: AtomicF32::new(1.0),
             session: session.clone(),
+            applied_session: Mutex::new(SessionState::default()),
             restore_chop: Mutex::new(None),
             playhead: AtomicF32::new(-1.0),
             chop_length: AtomicUsize::new(2),
@@ -1378,6 +1400,7 @@ impl Default for TempoSampler {
                 detune: IntParam::new("Detune", 0, IntRange::Linear { min: -50, max: 50 })
                     .with_unit(" ct")
                     .with_value_to_string(Arc::new(signed)),
+                picked: BoolParam::new("Sample pick", false),
             }),
             shared: Arc::new(shared),
             from_render,
@@ -1397,7 +1420,6 @@ impl Default for TempoSampler {
             pads: None,
             voices: std::array::from_fn(|_| None),
             last_voice: 0,
-            restored: false,
             applied_params: ParamValues { stem_mask: ALL_STEMS, chop_length: 2, tempo_scale: 1.0, pitch: Pitch::NONE },
         }
     }
@@ -1539,11 +1561,12 @@ impl Plugin for TempoSampler {
         if self.shared.host_rate.swap(rate, Ordering::Relaxed) != rate {
             self.requested_bpm = 0.0;
         }
-        // The Live set's saved state has been loaded by now: put it back (the
-        // first time only; later initializes are sample-rate changes etc.).
-        if !self.restored {
-            self.restored = true;
-            self.shared.restore_session();
+        // Put back the Live set's saved state if the host has loaded some
+        // since the last call. Live activates the plugin (one initialize)
+        // before loading the set's state (another initialize), so this can't
+        // be a first-call-only check. Sample-rate changes etc. find nothing new.
+        if self.shared.restore_if_loaded() {
+            self.requested_bpm = 0.0; // render the restored selection
         }
         // Parameter values as loaded are what's in effect (the session state
         // saved with them agrees); only later changes need applying. The
@@ -2119,16 +2142,20 @@ mod tests {
         // What Live stores: the persisted field, serialised.
         let saved = serde_json::to_string(&*first.params.session.lock().unwrap()).unwrap();
 
-        // Session 2: a fresh plugin given that state, then initialized.
+        // Session 2: a fresh plugin, in Live's order: activated (initialize
+        // with nothing loaded yet), then given the set's state (initialize
+        // again).
         let second = TempoSampler::default();
+        let shared2 = second.shared.clone();
+        assert!(!shared2.restore_if_loaded(), "nothing loaded yet");
         let mut state: SessionState = serde_json::from_str(&saved).unwrap();
         assert!(state.is_song);
         // Don't start a stem split here: it would share the GPU with the
         // stems test running alongside (the plugin only ever runs one).
         state.is_song = false;
         *second.params.session.lock().unwrap() = state;
-        let shared2 = second.shared.clone();
-        shared2.restore_session();
+        assert!(shared2.restore_if_loaded(), "state loaded after activation");
+        assert!(!shared2.restore_if_loaded(), "a later initialize changes nothing");
         assert_eq!(shared2.selection.lock().unwrap().key, path.to_string_lossy());
         assert_eq!(shared2.chop_length.load(Ordering::Relaxed), 4);
         assert_eq!(shared2.stem_switches.load(Ordering::Relaxed), 0b1110);

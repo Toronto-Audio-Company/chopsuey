@@ -365,6 +365,12 @@ impl AppData {
         }
     }
 
+    /// Tells Live the set changed (see `TempoSamplerParams::picked`), so it
+    /// offers to save before quitting.
+    fn mark_set_changed(&self, cx: &mut EventContext) {
+        set_param(cx, &self.params.picked, !self.params.picked.value());
+    }
+
     /// Makes `key` the active loop and re-renders it.
     fn select_key(&mut self, key: &str) {
         self.press_selected = false;
@@ -445,6 +451,7 @@ impl Model for AppData {
                 self.selected_chop = *index as i64;
                 self.message.clear();
                 self.request_render();
+                self.mark_set_changed(cx);
                 self.shared.preview.store(true, Ordering::Relaxed);
                 self.press_selected = true;
             }
@@ -453,6 +460,7 @@ impl Model for AppData {
                 self.selected_chop = -1;
                 self.message.clear();
                 self.request_render();
+                self.mark_set_changed(cx);
                 self.shared.preview.store(true, Ordering::Relaxed);
                 self.press_selected = true;
             }
@@ -509,6 +517,7 @@ impl Model for AppData {
                     self.rebuild_rows();
                 } else {
                     self.select_key(&key);
+                    self.mark_set_changed(cx);
                     // Held down: audition it, like a sample browser.
                     if self.press_selected {
                         self.shared.preview.store(true, Ordering::Relaxed);
