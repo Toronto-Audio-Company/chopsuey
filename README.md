@@ -1,8 +1,6 @@
 # chopsuey
 
-A VST3 instrument (Rust, nih-plug + vizia), formerly "Tempo Sampler", that reads Ableton's tempo, stretches loops to match it, previews them in sync, and lets you drag the stretched WAV straight into Ableton.
-
-For users: [docs/MANUAL.md](docs/MANUAL.md). Before a release: [docs/RELEASE.md](docs/RELEASE.md) and [docs/host-testing.md](docs/host-testing.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+A VST3 instrument (Rust, nih-plug + vizia), that reads Ableton's tempo, stretches loops to match it, previews them in sync, and lets you drag the stretched WAV straight into Ableton.
 
 ## Build and install (macOS)
 
@@ -35,15 +33,3 @@ chopsuey is an instrument: put it on a MIDI track (it appears under Plug-Ins →
 ## Stem model licence
 
 The HTDemucs weights may be research-only (trained on MUSDB). Personal use only; swap the model before distributing the plugin.
-
-## Development
-
-**Building.** `scripts/bundle.sh` builds `target/bundled/chopsuey.vst3` and `chopsuey.clap`, adds Dawn (`libwebgpu_dawn.dylib`), the stem helper `chopsuey-stems` (once the `stems_helper` crate exists) and the model, and signs them ad hoc. `--no-model` leaves the model out; `--universal` builds arm64 + x86_64 (run `rustup target add x86_64-apple-darwin` first). `packaging/au/build.sh` wraps the CLAP as an Audio Unit (`chopsuey.component`, `aumu Chsy TAud`) with clap-wrapper; it needs `brew install cmake`. Use `cargo xtask` from this repo rather than nih-plug's stock one: ours finds the right workspace inside a nested git worktree.
-
-**Validating.** `scripts/validate.sh` builds everything and runs pluginval (strictness 10, five sample rates by seven block sizes) on the VST3 and AU, Steinberg's VST3 validator, clap-validator and `auval -strict`. It also runs pluginval and clap-validator on a debug build with the `rt-checks` feature, which panics if `process()` allocates. The tools download to `target/tools` (`scripts/tools.sh`). Logs go to `target/validation`. CI (`.github/workflows/ci.yml`) runs the tests and this script on an Apple Silicon runner, without the stem model.
-
-**Releasing.** `scripts/release.sh` builds a universal release and makes `target/dist/chopsuey-<version>.pkg`, which installs the VST3, CLAP and AU in `/Library/Audio/Plug-Ins`, plus `uninstall-chopsuey.sh` to ship next to it. Set `DEVELOPER_ID_APP`, `DEVELOPER_ID_INSTALLER` and `NOTARY_PROFILE` (from `xcrun notarytool store-credentials`) to sign, notarize and staple it. Without them it signs ad hoc and skips notarization, which only suits testing. The release needs macOS 13.4 or later, because ONNX Runtime and Dawn do. ONNX Runtime has no prebuilt Intel Mac binaries, so the stem helper is arm64-only unless its Intel build succeeds: on Intel Macs the plugin works without stem separation.
-
-UI: the logo is `assets/logo.svg` (drawn by the plugin; plain M/L/C/Z paths only). After editing it, `scripts/make_icon.sh` rebuilds the Finder icon (`assets/chopsuey.icns`, needs `brew install librsvg`), which the install script puts on the plugin and on `~/Music/chopsuey`. All colours, spacing and type are in `src/style.css` (light sheet on a dark frame; tokens, the 8px grid and type rules are listed at the top). To see the UI without Ableton, run the standalone app (`cargo run --release --bin standalone -- --backend dummy`) or capture it: `scripts/screenshot.sh out.png "<part of a sample name>" [seconds]`; `TEMPO_SAMPLER_DEMO_CHOP=<n>` and `TEMPO_SAMPLER_DEMO_STEMS=0011` preselect a chop tile and stem switches.
-
-Dev tools (read-only): `cargo run --release --example detect_report -- <folder>` compares detected tempos with tempos in file names; `cargo run --release --example chop_report -- <folder>` lists the chops found in each song; `cargo run --release --example one_shot_report -- <folder or files>` lists the one-shots; `cargo run --release -p stems_helper --example split_stems -- models/htdemucs_fp16weights.onnx <song> <out-dir>` splits one file and reports timing (the plugin runs splits in its own `chopsuey-stems` helper process, built from `stems_helper/`); `cargo run --release --example probe_files -- <file>...` checks that files decode and shows their detected tempo. `cargo run --release --example key_bench -- <folder>` scores key-detection settings against keys written in file names. `cargo run --release --example load_bench [-- --cold]` times opening the library (on a copy of your settings); `--cold` drops the tempo cache. Set `TEMPO_SAMPLER_TIMING=1` to print scan and window timings from the plugin or standalone app.
