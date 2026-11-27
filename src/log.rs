@@ -1,7 +1,7 @@
 //! chopsuey's log file: `~/Library/Logs/chopsuey/chopsuey.log` (Console.app
 //! shows it under Log Reports). A plugin's stderr goes nowhere a user can
 //! find, so warnings, failures and panics (with a backtrace) are written
-//! here, and the "Report a problem" link opens it.
+//! here, for users to send with a bug report.
 //!
 //! Never call this from the audio thread: it takes a lock and writes a file.
 

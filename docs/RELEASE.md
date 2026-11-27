@@ -7,9 +7,8 @@ Everything that has to be true before a build goes to anyone else, then the step
 | What | Where | Why |
 |---|---|---|
 | Stem model licence | `models/`, `src/stems.rs` | The HTDemucs weights may be research-only. Swap or license the model. |
-| Production licence keypair | `PUBLIC_KEY` in `src/licence.rs` | It is the development key, whose private half sits in `tools/licence_keygen/dev-private-key.txt`. Make a new pair with `cargo run -p licence_keygen -- new-keypair --out <somewhere outside the repo>`, paste the printed public key, and keep the private key in a password manager. |
 | Vendor URL and email | `URL` and `EMAIL` in `src/lib.rs`; `CLAP_MANUAL_URL` and `CLAP_SUPPORT_URL` | Hosts show them, and users need somewhere to get help. |
-| Release repository | `LATEST_RELEASE_API` in `src/update.rs` | The update check reads this repo's latest GitHub release, so the repo must be public, or point it at another one. |
+| Release repository | `LATEST_RELEASE_API` in `src/update.rs` | The update check reads the latest GitHub release of `Toronto-Audio-Company/chopsuey` without signing in. That repo is private, so the check finds nothing until it's public (or releases go to a public repo and the URL points there). |
 | nih-plug's CLAP state handling | nih-plug `src/wrapper/clap/wrapper.rs`, `ext_state_load` | A corrupt saved CLAP or AU state makes it try to allocate whatever length the file claims, which crashes the host (clap-validator `state-invalid-random`). After loading state it also never asks the host to rescan parameter values (`state-reproducibility-*`). Both fixes are a few lines. Carry them in a fork via `[patch]` until they're upstream. |
 | Developer ID certificates | `DEVELOPER_ID_APP`, `DEVELOPER_ID_INSTALLER`, `NOTARY_PROFILE` (see `scripts/release.sh`) | Without them macOS blocks the installer on other Macs. |
 

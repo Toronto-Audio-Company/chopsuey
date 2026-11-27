@@ -1,5 +1,5 @@
-//! Telling the user a newer chopsuey is out. Off unless they turn it on
-//! ("Check for updates" in the sidebar).
+//! Telling the user a newer chopsuey is out (a line at the bottom of the
+//! sheet that opens the release page).
 //!
 //! At most once a day, asks GitHub for the latest release of the public
 //! repository and compares its tag with this build's version. The request
@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::safety::LockExt;
 
-/// Release blocker: must be the public repository releases are published to.
-pub const LATEST_RELEASE_API: &str = "https://api.github.com/repos/TheMarstonConnell/chopsuey/releases/latest";
+/// The repository releases are published to. It must be public: the check
+/// is anonymous, so a private repository answers "not found".
+pub const LATEST_RELEASE_API: &str = "https://api.github.com/repos/Toronto-Audio-Company/chopsuey/releases/latest";
 
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -34,15 +35,6 @@ struct Cache {
 
 static AVAILABLE: Mutex<Option<Release>> = Mutex::new(None);
 
-/// Checking is on (mirrors the library setting, for the GUI's per-frame label).
-pub static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Turning checks off forgets any release found.
-pub fn disable() {
-    ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-    *AVAILABLE.locked() = None;
-}
-
 /// A newer release than this build, once a check has found one.
 pub fn available() -> Option<Release> {
     AVAILABLE.locked().clone()
@@ -55,7 +47,6 @@ fn cache_path() -> PathBuf {
 /// Checks in the background, unless the last check (by any instance) was
 /// less than a day ago, in which case its answer is reused.
 pub fn check_in_background() {
-    ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::safety::spawn("chopsuey-update-check", || {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let cached: Cache = std::fs::read(cache_path())

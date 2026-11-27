@@ -181,7 +181,7 @@ pub fn split(input: &Path, out: &Path, mut progress: impl FnMut(f32), cancelled:
         (Some(e), _) => e,
         (None, Some(sig)) => {
             crate::logln!("stems helper killed by signal {sig}");
-            "The stem splitter crashed. Your set is fine; try again, and if it keeps happening send the log (Report a problem).".to_string()
+            "The stem splitter crashed. Your set is fine; try again, and if it keeps happening send the log from ~/Library/Logs/chopsuey.".to_string()
         }
         (None, None) => format!("The stem splitter stopped ({status})."),
     };

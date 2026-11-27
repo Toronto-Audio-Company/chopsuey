@@ -42,9 +42,6 @@ pub struct Config {
     /// Shows the list instantly on open and skips re-reading unchanged files.
     #[serde(default)]
     pub scan_cache: HashMap<String, Scanned>,
-    /// The user turned on "Check for updates" (see update.rs). Off by default.
-    #[serde(default)]
-    pub check_updates: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -316,17 +313,6 @@ impl Library {
         save_config(&mut st);
         drop(st);
         self.bump();
-    }
-
-    /// Turns the daily update check on or off. Saved to disk.
-    pub fn set_check_updates(&self, on: bool) {
-        let mut st = self.state.locked();
-        st.config.check_updates = on;
-        save_config(&mut st);
-    }
-
-    pub fn check_updates(&self) -> bool {
-        self.state.locked().config.check_updates
     }
 
     fn cancelled(&self, generation: u64) -> bool {
@@ -733,7 +719,6 @@ fn merge_config(base: &Config, ours: &Config, theirs: &Config) -> Config {
         favourites,
         detected: merge_map(&base.detected, &ours.detected, &theirs.detected),
         scan_cache: merge_map(&base.scan_cache, &ours.scan_cache, &theirs.scan_cache),
-        check_updates: if ours.check_updates != base.check_updates { ours.check_updates } else { theirs.check_updates },
     }
 }
 

@@ -3,9 +3,8 @@ use nih_plug::prelude::{AsyncExecutor, Editor, GuiContext, ParentWindowHandle};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::icons::{
     ICON_ADJUSTMENTS_ALT, ICON_FOLDER, ICON_FOLDERS, ICON_FOLDER_OPEN, ICON_FOLDER_PLUS,
-    ICON_REPEAT, ICON_STAR_FILLED, ICON_SEARCH, ICON_CUT, ICON_WAVE_SINE, ICON_X, ICON_ARROW_BIG_UP,
+    ICON_REPEAT, ICON_STAR_FILLED, ICON_SEARCH, ICON_CUT, ICON_WAVE_SINE, ICON_X,
 };
-use crate::licence;
 use nih_plug_vizia::vizia::vg;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{create_vizia_editor, ViziaState, ViziaTheming};
@@ -72,18 +71,6 @@ struct AppData {
     sample_count: usize,
     /// Feedback from the last action (export, drag, errors).
     message: String,
-    /// "Trial · 9 days left", "Licensed to …": the licence line in the sidebar.
-    licence_label: String,
-    /// The licence key box is open.
-    licence_open: bool,
-    /// What's typed or pasted in the licence key box.
-    licence_input: String,
-    /// Why the last activation failed, or "" (shown under the box).
-    licence_error: String,
-    /// A key is activated (the box offers to remove it).
-    licensed: bool,
-    /// "Check for updates" is on.
-    check_updates: bool,
     /// Index of the selected chop, -1 for the whole file.
     selected_chop: i64,
     /// Whether the last press selected something, so a drag that follows
@@ -178,15 +165,8 @@ enum AppEvent {
     ShowInFinder,
     /// Drag after pressing a row or tile (only if the press selected it).
     StartDrag,
-    /// Open or close the licence key box.
-    ToggleLicence,
-    LicenceInput(String),
-    Activate,
-    Deactivate,
-    /// Turn update checks on/off, or open the release page if one's found.
-    UpdatesItem,
-    /// Reveal the log in Finder, to send to support.
-    ReportProblem,
+    /// Open the page of the newer release that was found.
+    OpenUpdate,
 }
 
 impl AppData {
@@ -392,19 +372,6 @@ impl AppData {
     /// offers to save before quitting.
     fn mark_set_changed(&self, cx: &mut EventContext) {
         set_param(cx, &self.params.picked, !self.params.picked.value());
-    }
-
-    /// Licensed or still in the trial. Otherwise says how to unlock
-    /// dragging samples out (previews and pads keep working).
-    fn unlocked(&mut self) -> bool {
-        let status = licence::status();
-        self.licence_label = licence_label(&status);
-        if status.is_unlocked() {
-            return true;
-        }
-        self.message = "Your trial has ended. Enter a licence key (bottom left) to drag samples into your set.".into();
-        self.licence_open = true;
-        false
     }
 
     /// Makes `key` the active loop and re-renders it.
@@ -628,9 +595,6 @@ impl Model for AppData {
                     if !self.press_selected {
                         return; // the press didn't select anything draggable
                     }
-                    if !self.unlocked() {
-                        return;
-                    }
                     let result = self.shared.export_current().and_then(|path| {
                         drag::start_file_drag(self.parent_view.load(Ordering::Acquire), &path)
                     });
@@ -638,7 +602,6 @@ impl Model for AppData {
                         self.message = format!("Drag failed: {e}");
                     }
                 }
-                AppEvent::ShowInFinder if !self.unlocked() => {}
                 AppEvent::ShowInFinder => {
                     self.message = match self.shared.export_current() {
                         Ok(path) => {
@@ -648,49 +611,10 @@ impl Model for AppData {
                         Err(e) => format!("Export failed: {e}"),
                     };
                 }
-                AppEvent::ToggleLicence => {
-                    self.licence_open = !self.licence_open;
-                    self.licence_error.clear();
-                }
-                AppEvent::LicenceInput(text) => self.licence_input = text.clone(),
-                AppEvent::Activate => match licence::activate(&self.licence_input) {
-                    Ok(status) => {
-                        self.licence_label = licence_label(&status);
-                        self.licensed = true;
-                        self.licence_input.clear();
-                        self.licence_error.clear();
-                        self.licence_open = false;
-                        self.message = "Thanks! chopsuey is activated.".into();
-                    }
-                    Err(e) => self.licence_error = e,
-                },
-                AppEvent::Deactivate => {
-                    licence::deactivate();
-                    let status = licence::status();
-                    self.licence_label = licence_label(&status);
-                    self.licensed = false;
-                }
-                AppEvent::UpdatesItem => {
+                AppEvent::OpenUpdate => {
                     if let Some(release) = crate::update::available() {
                         let _ = std::process::Command::new("open").arg(&release.url).spawn();
-                    } else {
-                        self.check_updates = !self.check_updates;
-                        self.shared.library.set_check_updates(self.check_updates);
-                        if self.check_updates {
-                            crate::update::check_in_background();
-                        } else {
-                            crate::update::disable();
-                        }
                     }
-                }
-                AppEvent::ReportProblem => {
-                    self.message = match crate::log::path().filter(|p| p.exists()) {
-                        Some(path) => {
-                            let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
-                            "The log is selected in Finder: attach it to an email to support, with what you were doing.".into()
-                        }
-                        None => "Nothing has been logged yet.".into(),
-                    };
                 }
             });
             self.keep_list_position(cx);
@@ -776,7 +700,7 @@ fn format_duration(secs: f32) -> String {
 /// stretching. Nothing once it's playing.
 fn render_status(s: &Shared) -> Option<String> {
     if s.audio_fault.load(Ordering::Relaxed) {
-        return Some("Sound stopped after an internal error. Reopen the set (or remove and re-add chopsuey) to start it again; Report a problem has the details.".into());
+        return Some("Sound stopped after an internal error. Reopen the set (or remove and re-add chopsuey) to start it again. The details are in ~/Library/Logs/chopsuey.".into());
     }
     if let Some(e) = s.render_error.locked().as_ref() {
         return Some(e.clone());
@@ -825,10 +749,7 @@ pub(crate) fn create(
             shared.chop_length.store(bars, Ordering::Relaxed);
         }
         let selected_key = shared.selection.locked().key.clone();
-        let check_updates = shared.library.check_updates();
-        if check_updates {
-            crate::update::check_in_background();
-        }
+        crate::update::check_in_background();
         AppData {
             shared: shared.clone(),
             params: params.clone(),
@@ -861,12 +782,6 @@ pub(crate) fn create(
             toggled_folders: Default::default(),
             sample_count: 0,
             message: String::new(),
-            licence_label: licence_label(&licence::status()),
-            licence_open: false,
-            licence_input: String::new(),
-            licence_error: String::new(),
-            licensed: matches!(licence::status(), licence::Status::Licensed { .. }),
-            check_updates,
             // A chop restored from the Live set shows as selected.
             selected_chop: shared.selection.locked().chop.as_ref().map_or(-1, |c| c.index as i64),
             press_selected: true,
@@ -1265,71 +1180,9 @@ fn sidebar(cx: &mut Context) {
         })
         .class("nav-group");
 
-        Element::new(cx).height(Pixels(1.0)).background_color(Color::rgb(0x22, 0x22, 0x22));
-        VStack::new(cx, |cx| {
-            nav_item(cx, ICON_KEY, AppData::licence_label, || AppEvent::ToggleLicence).checked(AppData::licence_open);
-            licence_box(cx);
-            nav_item(
-                cx,
-                ICON_ARROW_BIG_UP,
-                AppData::shared.map(|_| update_label()),
-                || AppEvent::UpdatesItem,
-            )
-            .checked(AppData::check_updates);
-            nav_item(cx, ICON_BUG, "Report a problem", || AppEvent::ReportProblem);
-        })
-        .class("nav-group");
     })
     .class("sidebar")
     .height(Stretch(1.0));
-}
-
-/// The licence key box under the licence line, while it's open.
-fn licence_box(cx: &mut Context) {
-    VStack::new(cx, |cx| {
-        Textbox::new(cx, AppData::licence_input)
-            .placeholder("Paste your licence key")
-            .on_edit(|cx, text| cx.emit(AppEvent::LicenceInput(text)))
-            .on_submit(|cx, _, _| cx.emit(AppEvent::Activate))
-            .class("search")
-            .width(Stretch(1.0));
-        Label::new(cx, AppData::licence_error)
-            .class("muted")
-            .text_wrap(true)
-            .toggle_class("hidden", AppData::licence_error.map(|e| e.is_empty()));
-        HStack::new(cx, |cx| {
-            Button::new(cx, |cx| cx.emit(AppEvent::Activate), |cx| Label::new(cx, "Activate")).class("nav-item");
-            Button::new(cx, |cx| cx.emit(AppEvent::Deactivate), |cx| Label::new(cx, "Remove licence"))
-                .class("nav-item")
-                .toggle_class("hidden", AppData::licensed.map(|l| !l));
-        })
-        .col_between(Pixels(ICON_GAP))
-        .height(Auto);
-    })
-    .child_left(Pixels(ICON_COLUMN))
-    .row_between(Pixels(4.0))
-    .height(Auto)
-    .toggle_class("hidden", AppData::licence_open.map(|open| !open));
-}
-
-/// The licence line: where the trial or licence stands.
-fn licence_label(status: &licence::Status) -> String {
-    match status {
-        licence::Status::Licensed { name, .. } => format!("Licensed to {name}"),
-        licence::Status::Trial { days_left: 1 } => "Trial · 1 day left".into(),
-        licence::Status::Trial { days_left } => format!("Trial · {days_left} days left"),
-        licence::Status::TrialOver => "Trial over · enter a key".into(),
-    }
-}
-
-/// The updates line. Runs every frame (a found release appears without a
-/// click); the lock it reads is uncontended.
-fn update_label() -> String {
-    match crate::update::available() {
-        Some(release) => format!("Update {} available", release.version),
-        None if crate::update::ENABLED.load(Ordering::Relaxed) => "Checking for updates".into(),
-        None => "Check for updates".into(),
-    }
 }
 
 fn folder_list(cx: &mut Context) {
@@ -1379,6 +1232,7 @@ fn sheet(cx: &mut Context) {
         song_cards(cx);
         Element::new(cx).height(Stretch(1.0));
         status_line(cx);
+        update_line(cx);
     })
     .class("sheet")
     .width(Stretch(1.0))
@@ -1570,8 +1424,6 @@ impl View for PitchBox {
 /// Tabler "star" outline (in vizia's bundled icon font, not in its list of names).
 const ICON_STAR: &str = "\u{eb2e}";
 /// Tabler "key" and "bug" (the font has them; vizia names only some).
-const ICON_KEY: &str = "\u{eac7}";
-const ICON_BUG: &str = "\u{ea48}";
 
 /// Tabler "external-link" (in vizia's bundled icon font, not in its list of names).
 const ICON_EXTERNAL_LINK: &str = "\u{ea99}";
@@ -1762,6 +1614,23 @@ fn status_line(cx: &mut Context) {
         .class("status-line")
         .text_wrap(false)
         .toggle_class("hidden", AppData::message.map(|m| m.is_empty()));
+}
+
+/// "chopsuey 1.2.0 is out", once the update check finds a newer release;
+/// clicking it opens the release page. Hidden otherwise.
+fn update_line(cx: &mut Context) {
+    Button::new(cx, |cx| cx.emit(AppEvent::OpenUpdate), |cx| {
+        Label::new(
+            cx,
+            AppData::shared.map(|_| match crate::update::available() {
+                Some(release) => format!("chopsuey {} is out · Download", release.version),
+                None => String::new(),
+            }),
+        )
+    })
+    .class("status-line")
+    .class("update-line")
+    .toggle_class("hidden", AppData::shared.map(|_| crate::update::available().is_none()));
 }
 
 /// Short files: one wide tile with the whole (stretched) file, in the same

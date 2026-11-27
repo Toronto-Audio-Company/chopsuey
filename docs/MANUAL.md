@@ -77,15 +77,8 @@ You can automate these parameters or MIDI-map them in Live:
 - Match loudness
 - Sync preview
 
-## Licence
-
-chopsuey runs fully for **14 days**. After that, browsing, previews and pads keep working, and dragging samples into your set needs a licence.
-
-- **To activate:** click the **Trial** line at the bottom left of the sidebar, paste your licence key, and press **Activate**. You don't need to be online.
-- **Another Mac:** your key works on all your own computers. To move it, choose **Remove licence** on the old one.
-
 ## Updates and help
 
-- **Check for updates:** off until you turn it on. When it's on, chopsuey checks once a day and shows **Update x.y.z available** when there is one. Click it to open the download page. The check sends nothing about you or your computer.
-- **Report a problem:** shows chopsuey's log in Finder. Email it to support with a sentence about what you were doing.
+- **Updates:** chopsuey checks once a day for a newer version. When there is one, a line at the bottom of the window says **chopsuey x.y.z is out**. Click it to open the download page. The check sends nothing about you or your computer.
+- **Reporting a problem:** chopsuey's log is in `~/Library/Logs/chopsuey`. Send `chopsuey.log` with a sentence about what you were doing.
 - **If chopsuey ever goes silent and says it stopped after an internal error,** your set is safe. Reopen the set to start it again, and please send the log.

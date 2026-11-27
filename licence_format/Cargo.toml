@@ -1,9 +1,0 @@
-[package]
-name = "licence_format"
-version = "0.1.0"
-edition = "2021"
-description = "chopsuey licence keys: payload encoding and Ed25519 checks, shared by the plugin and the key generator"
-publish = false
-
-[dependencies]
-ed25519-dalek = "2"

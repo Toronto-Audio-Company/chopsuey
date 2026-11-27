@@ -41,14 +41,10 @@ Use both Apple Silicon and Intel (or Live under Rosetta) for the universal build
 - [ ] Move the sample's folder, add the new folder, and reopen the set: the sample is found again. Remove the folder entirely: the sheet says what's missing.
 - [ ] Two instances: star a sample in one and a different one in the other. Both stars survive a restart.
 
-**Licence**
-- [ ] A fresh Mac shows "Trial · 14 days left".
-- [ ] Paste a key: activation works. A bad key gives a clear message. With the trial over, dragging out asks for a key and previews still play.
-
 **Other**
 - [ ] Automate and MIDI-map Transpose, the stem switches and Sync preview.
 - [ ] Resize the window from the corner. Reopen the set: the size is kept.
-- [ ] Report a problem reveals the log.
+- [ ] With an older version installed than the latest release, the window says a new version is out, and clicking it opens the release page.
 
 ## Quick list for other hosts
 - [ ] Loading: it scans, inserts, and plays MIDI pads.

@@ -570,6 +570,20 @@ chop-tile label {
   right: 1s;
 }
 
+/* "chopsuey 1.2.0 is out · Download": a link-like line under the status line. */
+button.update-line {
+  height: auto;
+  width: auto;
+  background-color: transparent;
+  border-width: 0px;
+  cursor: hand;
+}
+button.update-line label {
+  font-size: 11;
+  font-weight: normal;
+  color: #2f6fd6;
+}
+
 .empty-state label {
   color: #616161;
 }
