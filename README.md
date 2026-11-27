@@ -2,6 +2,8 @@
 
 A VST3 instrument (Rust, nih-plug + vizia), that reads Ableton's tempo, stretches loops to match it, previews them in sync, and lets you drag the stretched WAV straight into Ableton.
 
+![The chopsuey window: a sample browser filtered to 100–110 BPM, and a song split into drum, bass, other and vocal stems with two-bar chops](site/screenshot.webp)
+
 ## Build and install (macOS)
 
 One command downloads the stem separation model (166 MB, first time only), runs the tests, builds the plugin and installs it where Ableton looks for VST3s:
