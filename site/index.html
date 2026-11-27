@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>chopsuey</title>
+    <meta name="description" content="A little sample chopper and looper for Ableton Live." />
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      /* yamsap's site palette (site/src/index.css): zinc on white. */
+      :root {
+        --background: 0 0% 100%;
+        --foreground: 240 10% 4%;
+        --primary: 240 6% 10%;
+        --primary-foreground: 0 0% 98%;
+        --muted-foreground: 240 4% 46%;
+        --border: 240 6% 90%;
+        --radius: 0.5rem;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+      }
+      body {
+        background: hsl(var(--background));
+        color: hsl(var(--foreground));
+        font-family: "Archivo", ui-sans-serif, system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
+      main {
+        max-width: 72rem;
+        margin: 0 auto;
+        padding: 4rem 1.5rem;
+      }
+      @media (min-width: 640px) {
+        main {
+          padding: 6rem 1.5rem;
+        }
+      }
+      h1 {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        font-family: "Source Serif 4", ui-serif, Georgia, serif;
+        font-weight: 700;
+        letter-spacing: -0.025em;
+        font-size: 2.25rem;
+        line-height: 1;
+      }
+      @media (min-width: 640px) {
+        h1 {
+          font-size: 3rem;
+        }
+      }
+      @media (min-width: 1024px) {
+        h1 {
+          font-size: 3.75rem;
+        }
+      }
+      h1 img {
+        width: 1em;
+        height: 1em;
+      }
+      /* yamsap's hero paragraph: text-lg, muted, max-w-2xl. */
+      .lede {
+        max-width: 42rem;
+        margin-top: 1.5rem;
+        font-size: 1.125rem;
+        line-height: 1.75rem;
+        color: hsl(var(--muted-foreground));
+      }
+      /* The one-line install: a hairline box like yamsap's plates, square-ish
+         corners, the command in a monospace face and a quiet copy button. */
+      .label {
+        margin-top: 2rem;
+        font-weight: 500;
+      }
+      /* Title on the left, the GitHub button pushed to the far right. */
+      .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+      .install {
+        display: flex;
+        align-items: stretch;
+        width: fit-content;
+        max-width: 100%;
+        margin-top: 0.75rem;
+        border: 1px solid hsl(var(--border));
+        border-radius: calc(var(--radius) - 4px);
+        background: hsl(240 5% 96%);
+      }
+      .install code {
+        flex: 1;
+        min-width: 0;
+        overflow-x: auto;
+        white-space: nowrap;
+        padding: 0.75rem 1rem;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 0.875rem;
+        line-height: 1.5rem;
+      }
+      .install button {
+        flex: none;
+        padding: 0 1rem;
+        border: 0;
+        border-left: 1px solid hsl(var(--border));
+        background: none;
+        color: hsl(var(--muted-foreground));
+        font: inherit;
+        font-size: 0.875rem;
+        cursor: pointer;
+      }
+      .install button:hover {
+        color: hsl(var(--foreground));
+      }
+      .needs {
+        margin-top: 0.5rem;
+        font-size: 0.875rem;
+        color: hsl(var(--muted-foreground));
+      }
+      .needs a {
+        color: inherit;
+      }
+      .needs a:hover {
+        color: hsl(var(--foreground));
+      }
+      .cta {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex: none;
+        padding: 0.75rem 1.5rem;
+        border-radius: calc(var(--radius) - 4px);
+        background: hsl(var(--primary));
+        color: hsl(var(--primary-foreground));
+        font-weight: 500;
+        text-decoration: none;
+      }
+      /* On a phone the button shortens to "Star" so it fits beside the title. */
+      @media (max-width: 639px) {
+        .cta {
+          padding: 0.5rem 0.875rem;
+          font-size: 0.875rem;
+        }
+        .cta .long {
+          display: none;
+        }
+      }
+      .cta:hover {
+        background: hsl(var(--primary) / 0.9);
+      }
+      .cta svg {
+        width: 1.125rem;
+        height: 1.125rem;
+      }
+      /* yamsap's screenshot plate: a slight tilt toward the top-left with a
+         shadow falling down-right. drop-shadow rather than box-shadow so it
+         follows the window's rounded corners. */
+      .plate {
+        display: block;
+        width: 100%;
+        height: auto;
+        margin-top: 3rem;
+        transform: perspective(1400px) rotateX(3deg) rotateY(-4deg);
+        filter: drop-shadow(0 20px 18px rgb(0 0 0 / 0.22)) drop-shadow(0 4px 5px rgb(0 0 0 / 0.08));
+      }
+      @keyframes rise-in {
+        from {
+          opacity: 0;
+          transform: translateY(8px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+      .rise-in {
+        animation: rise-in 0.3s ease-out both;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .rise-in {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="rise-in">
+      <header class="top">
+        <h1><img src="favicon.svg" alt="" />chopsuey</h1>
+        <a class="cta" href="https://github.com/Toronto-Audio-Company/chopsuey">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path
+              d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 0-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.4 1.2a11.5 11.5 0 0 1 6 0C17.3 4.6 18.3 5 18.3 5c.7 1.6.2 2.8.1 3.2.8.8 1.3 1.9 1.3 3.1 0 4.6-2.8 5.6-5.5 5.9.5.4.9 1.1.9 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3"
+            />
+          </svg>
+          <span>Star<span class="long"> on GitHub</span></span>
+        </a>
+      </header>
+      <p class="lede">
+        Automatically chops, splices and tempo-syncs your samples into usable loops &amp; one-shots.
+      </p>
+      <p class="label">Run this in Terminal to install chopsuey:</p>
+      <div class="install">
+        <code id="cmd">curl -fsSL https://raw.githubusercontent.com/Toronto-Audio-Company/chopsuey/main/scripts/get.sh | bash</code>
+        <button type="button" id="copy">Copy</button>
+      </div>
+      <p class="needs">macOS only. Installs <a href="https://rustup.rs">Rust</a> too if you don't have it. Restart Live afterwards.</p>
+      <img
+        class="plate"
+        src="screenshot.webp"
+        width="1600"
+        height="1160"
+        alt="The chopsuey window: a sample browser filtered to 100–110 BPM, and a song split into drum, bass, other and vocal stems with two-bar chops"
+      />
+    </main>
+    <script>
+      const copy = document.getElementById("copy");
+      copy.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(document.getElementById("cmd").textContent);
+          copy.textContent = "Copied";
+        } catch {
+          copy.textContent = "Select and copy";
+        }
+        setTimeout(() => (copy.textContent = "Copy"), 1500);
+      });
+    </script>
+  </body>
+</html>
