@@ -17,6 +17,9 @@ fi
 fetch_model
 
 step "Testing"
+# The stems test runs the real helper from target/release, and `cargo test`
+# doesn't build another crate's binaries, so a fresh clone needs it built first.
+cargo build --release -p "$HELPER_CRATE"
 cargo test --release --workspace
 
 # Builds, adds the stem helper, Dawn and the model, and signs ad hoc.
